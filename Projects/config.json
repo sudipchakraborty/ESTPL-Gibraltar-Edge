@@ -1,0 +1,11 @@
+{
+    "image_repository_path": "D:\\ESTPL\\Saved_Image_Gibraltar",
+    "database": {
+        "name": "gibraltar",
+        "table": "inspection_records",
+        "server_url": "http://127.0.0.1:3000",
+        "site_id": "GIBRALTAR",
+        "section_id": "VISUAL-AI",
+        "match_event_cooldown_seconds": 30
+    }
+}
