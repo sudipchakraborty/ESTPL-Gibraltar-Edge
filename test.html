@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+
+<html>
+
+<head>
+
+    <title>DeepVision WebRTC Test</title>
+
+</head>
+
+<body>
+
+    <h1>DeepVision Live Stream</h1>
+
+    <video
+        id="video"
+        autoplay
+        playsinline
+        muted
+        style="
+            width: 900px;
+            background: black;
+        "
+    ></video>
+
+
+    <script>
+
+        async function start() {
+
+            const pc = new RTCPeerConnection();
+
+            pc.addTransceiver(
+                "video",
+                {
+                    direction: "recvonly"
+                }
+            );
+
+
+            pc.ontrack = (event) => {
+
+                console.log(
+                    "Video received"
+                );
+
+                document.getElementById(
+                    "video"
+                ).srcObject =
+                    event.streams[0];
+
+            };
+
+
+            const offer =
+                await pc.createOffer();
+
+
+            await pc.setLocalDescription(
+                offer
+            );
+
+
+            // Wait for ICE gathering
+
+            await new Promise(resolve => {
+
+                if (
+                    pc.iceGatheringState ===
+                    "complete"
+                ) {
+
+                    resolve();
+
+                } else {
+
+                    pc.addEventListener(
+
+                        "icegatheringstatechange",
+
+                        () => {
+
+                            if (
+                                pc.iceGatheringState ===
+                                "complete"
+                            ) {
+
+                                resolve();
+
+                            }
+
+                        }
+
+                    );
+
+                }
+
+            });
+
+
+            const response = await fetch(
+
+                "http://192.168.1.87:8000/offer",
+
+                {
+
+                    method: "POST",
+
+                    headers: {
+
+                        "Content-Type":
+                            "application/json"
+
+                    },
+
+                    body: JSON.stringify({
+
+                        sdp:
+                            pc.localDescription.sdp,
+
+                        type:
+                            pc.localDescription.type
+
+                    })
+
+                }
+
+            );
+
+
+            const answer =
+                await response.json();
+
+
+            await pc.setRemoteDescription(
+                answer
+            );
+
+        }
+
+
+        start();
+
+    </script>
+
+</body>
+
+</html>

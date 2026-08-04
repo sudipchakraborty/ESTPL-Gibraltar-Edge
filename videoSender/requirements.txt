@@ -1,0 +1,6 @@
+aiortc
+av
+fastapi
+numpy
+opencv-python
+uvicorn[standard]

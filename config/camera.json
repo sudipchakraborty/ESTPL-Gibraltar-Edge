@@ -1,0 +1,25 @@
+{
+    "cameras": [
+        {
+            "id": "camera_1",
+            "name": "Camera-1",
+            "source": 0,
+            "enabled": true,
+            "ai_mode": "ocr"
+        },
+        {
+            "id": "camera_2",
+            "name": "Camera-2",
+            "source": 1,
+            "enabled": true,
+            "ai_mode": "object_detection"
+        },
+        {
+            "id": "camera_3",
+            "name": "Camera-3",
+            "source": 2,
+            "enabled": true,
+            "ai_mode": "object_detection"
+        }
+    ]
+}

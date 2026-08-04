@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>VisualAI Live Camera</title>
+  <style>
+    :root { color-scheme: dark; font-family: system-ui, sans-serif; }
+    body { margin: 0; background: #101418; color: #e8eef3; }
+    main { width: min(1100px, 94vw); margin: 24px auto; }
+    video { width: 100%; background: #000; border-radius: 10px; }
+    .bar { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; }
+    button { padding: 9px 16px; cursor: pointer; }
+    #status { color: #9cc9e8; }
+  </style>
+</head>
+<body>
+  <main>
+    <div class="bar">
+      <button id="connect">Connect live video</button>
+      <span id="status">Disconnected</span>
+    </div>
+    <video id="video" autoplay muted playsinline></video>
+  </main>
+  <script>
+    const button = document.querySelector("#connect");
+    const status = document.querySelector("#status");
+    const video = document.querySelector("#video");
+    let peerConnection;
+
+    function waitForIceGathering(peer) {
+      if (peer.iceGatheringState === "complete") return Promise.resolve();
+      return new Promise(resolve => {
+        const listener = () => {
+          if (peer.iceGatheringState === "complete") {
+            peer.removeEventListener("icegatheringstatechange", listener);
+            resolve();
+          }
+        };
+        peer.addEventListener("icegatheringstatechange", listener);
+      });
+    }
+
+    button.addEventListener("click", async () => {
+      button.disabled = true;
+      status.textContent = "Connecting…";
+      try {
+        peerConnection = new RTCPeerConnection();
+        peerConnection.addTransceiver("video", { direction: "recvonly" });
+        peerConnection.addEventListener("track", event => {
+          video.srcObject = event.streams[0];
+        });
+        peerConnection.addEventListener("connectionstatechange", () => {
+          status.textContent = peerConnection.connectionState;
+          if (["failed", "closed", "disconnected"].includes(
+            peerConnection.connectionState
+          )) {
+            button.disabled = false;
+          }
+        });
+
+        const offer = await peerConnection.createOffer();
+        await peerConnection.setLocalDescription(offer);
+        await waitForIceGathering(peerConnection);
+
+        const response = await fetch("/offer", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(peerConnection.localDescription),
+        });
+        if (!response.ok) throw new Error(await response.text());
+        const answer = await response.json();
+        await peerConnection.setRemoteDescription(answer);
+      } catch (error) {
+        status.textContent = `Error: ${error.message}`;
+        button.disabled = false;
+        peerConnection?.close();
+      }
+    });
+  </script>
+</body>
+</html>

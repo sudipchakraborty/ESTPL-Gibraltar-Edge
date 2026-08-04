@@ -1,0 +1,27 @@
+
+# pip freeze > requirements.txt
+
+ultralytics
+opencv-python
+numpy
+python-dotenv
+requests
+python-socketio
+websocket-client
+shapely
+supervision
+scipy
+filterpy
+pillow
+PySide6
+# "python-socketio[client]"
+
+fastapi
+uvicorn[standard]
+python-socketio[client]
+paho-mqtt
+aiortc
+av
+
+paddlepaddle==3.2.2
+paddleocr==3.2.0

@@ -4,6 +4,7 @@ The camera is opened once. Every captured frame is broadcast to one OCR worker
 and two object-detection workers, then displayed in three PySide6 panels.
 Repository-level OCR and detection modules are referenced rather than copied.
 """
+####.\.venv\Scripts\python.exe Projects/main.py
 
 from __future__ import annotations
 
@@ -25,7 +26,7 @@ import numpy as np
 
 
 PROJECT_DIR = Path(__file__).resolve().parent
-REPOSITORY_DIR = PROJECT_DIR.parents[2]
+REPOSITORY_DIR = PROJECT_DIR.parent
 CONFIG_PATH = PROJECT_DIR / "config.json"
 if str(REPOSITORY_DIR) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_DIR))
