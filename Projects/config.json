@@ -7,5 +7,19 @@
         "site_id": "GIBRALTAR",
         "section_id": "VISUAL-AI",
         "match_event_cooldown_seconds": 30
-    }
+    },
+    "camera_sources": [
+        {
+            "type": "usb",
+            "value": "0"
+        },
+        {
+            "type": "rtsp",
+            "value": ""
+        },
+        {
+            "type": "rtsp",
+            "value": ""
+        }
+    ]
 }

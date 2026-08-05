@@ -51,6 +51,10 @@ class LocalCamera:
                 return False, None
         return self._capture.read()
 
+    def read_latest(self) -> tuple[bool, Any]:
+        """Match the RTSP camera interface used by camera consumers."""
+        return self.read()
+
     def release(self) -> None:
         if self._capture is not None:
             self._capture.release()

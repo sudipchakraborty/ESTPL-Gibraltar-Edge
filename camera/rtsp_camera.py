@@ -136,6 +136,17 @@ class RTSPCamera:
             # an entire 1920x1080 frame.
             return True, self._latest_frame
 
+    def read_latest(self) -> tuple[bool, Any]:
+        """Return a new latest frame immediately, without blocking the GUI."""
+        with self._frame_ready:
+            if (
+                self._latest_frame is None
+                or self._frame_sequence == self._last_read_sequence
+            ):
+                return False, None
+            self._last_read_sequence = self._frame_sequence
+            return True, self._latest_frame
+
     def _reader_loop(self) -> None:
         """Drain RTSP continuously so slow analysis cannot create video lag."""
         while not self._stop_event.is_set():

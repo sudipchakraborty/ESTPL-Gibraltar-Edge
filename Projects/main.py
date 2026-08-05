@@ -1,8 +1,7 @@
-"""Gibraltar three-panel visual AI dashboard using one built-in camera.
+"""Gibraltar three-panel visual AI dashboard using three camera sources.
 
-The camera is opened once. Every captured frame is broadcast to one OCR worker
-and two object-detection workers, then displayed in three PySide6 panels.
-Repository-level OCR and detection modules are referenced rather than copied.
+Each configured RTSP or USB camera feeds its respective OCR/object-detection
+worker and panel. Sources are managed from the GUI and persisted in config.json.
 """
 ####.\.venv\Scripts\python.exe Projects/main.py
 
@@ -31,7 +30,7 @@ CONFIG_PATH = PROJECT_DIR / "config.json"
 if str(REPOSITORY_DIR) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_DIR))
 
-from camera import LocalCamera  # noqa: E402
+from camera import LocalCamera, RTSPCamera  # noqa: E402
 from communication.inspection_sender import InspectionSender  # noqa: E402
 from communication.socket_client import SocketClient  # noqa: E402
 
@@ -60,6 +59,47 @@ def save_image_repository_path(repository_path: Path) -> None:
     """Persist the user's selected external snapshot path."""
     config = load_project_config()
     config["image_repository_path"] = str(repository_path.resolve())
+    temporary_path = CONFIG_PATH.with_suffix(".json.tmp")
+    with temporary_path.open("w", encoding="utf-8") as config_file:
+        json.dump(config, config_file, indent=4)
+        config_file.write("\n")
+    temporary_path.replace(CONFIG_PATH)
+
+
+def load_camera_sources() -> list[dict[str, str]]:
+    """Load three camera sources, including legacy ``camera_urls`` values."""
+    config = load_project_config()
+    configured = config.get("camera_sources")
+    sources: list[dict[str, str]] = []
+    if isinstance(configured, list):
+        for item in configured[:3]:
+            if not isinstance(item, dict):
+                sources.append({"type": "rtsp", "value": ""})
+                continue
+            source_type = str(item.get("type", "rtsp")).strip().lower()
+            if source_type not in {"rtsp", "usb"}:
+                source_type = "rtsp"
+            sources.append(
+                {"type": source_type, "value": str(item.get("value", "")).strip()}
+            )
+    else:
+        legacy_urls = config.get("camera_urls", [])
+        if isinstance(legacy_urls, list):
+            sources = [
+                {"type": "rtsp", "value": str(value).strip()}
+                for value in legacy_urls[:3]
+            ]
+    return sources + [
+        {"type": "rtsp", "value": ""}
+        for _ in range(3 - len(sources))
+    ]
+
+
+def save_camera_sources(camera_sources: list[dict[str, str]]) -> None:
+    """Persist the three independent camera sources."""
+    config = load_project_config()
+    config["camera_sources"] = camera_sources
+    config.pop("camera_urls", None)
     temporary_path = CONFIG_PATH.with_suffix(".json.tmp")
     with temporary_path.open("w", encoding="utf-8") as config_file:
         json.dump(config, config_file, indent=4)
@@ -129,13 +169,15 @@ def visual_similarity(first: np.ndarray, second: np.ndarray) -> float:
     return max(0.0, min(1.0, (float(correlation) + 1.0) / 2.0))
 
 
-def create_ocr_processor(device: str) -> Callable[[np.ndarray], np.ndarray]:
+def create_ocr_processor(
+    device: str,
+) -> Callable[[np.ndarray], tuple[np.ndarray, dict[str, Any]]]:
     from OCR.PaddleOCR import OCR, OCRConfig
     from OCR.PaddleOCR.drawing import draw_result
 
     reader = OCR(OCRConfig(device=device))
 
-    def process(frame: np.ndarray) -> np.ndarray:
+    def process(frame: np.ndarray) -> tuple[np.ndarray, dict[str, Any]]:
         result = reader.read(frame)
         output = draw_result(frame, result, copy=False)
         cv2.putText(
@@ -148,7 +190,7 @@ def create_ocr_processor(device: str) -> Callable[[np.ndarray], np.ndarray]:
             2,
             cv2.LINE_AA,
         )
-        return output
+        return output, {"ocr": result.as_dict()}
 
     return process
 
@@ -214,8 +256,15 @@ def processing_worker(
             if encoded is None:
                 break
             frame = decode_frame(encoded)
-            output = processor(frame)
-            latest_put(output_queue, ("frame", encode_frame(output)))
+            processed = processor(frame)
+            if isinstance(processed, tuple):
+                output, metadata = processed
+            else:
+                output, metadata = processed, {}
+            latest_put(
+                output_queue,
+                ("frame", (encode_frame(output), metadata)),
+            )
     except Exception as error:
         if not stop_event.is_set():
             latest_put(
@@ -226,13 +275,13 @@ def processing_worker(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Gibraltar built-in-camera visual AI dashboard",
+        description="Gibraltar three-camera RTSP visual AI dashboard",
     )
     parser.add_argument(
         "--camera",
         type=int,
         default=0,
-        help="built-in/OpenCV camera index (default: 0)",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument("--width", type=int, default=1280)
     parser.add_argument("--height", type=int, default=720)
@@ -250,14 +299,23 @@ def run_gui(args: argparse.Namespace) -> int:
     from PySide6.QtGui import QImage, QPixmap
     from PySide6.QtWidgets import (
         QApplication,
+        QDialog,
+        QDialogButtonBox,
         QFileDialog,
+        QFormLayout,
         QFrame,
         QGridLayout,
+        QHeaderView,
         QHBoxLayout,
         QLabel,
+        QLineEdit,
+        QComboBox,
         QMainWindow,
+        QMessageBox,
         QPushButton,
         QProgressBar,
+        QTableWidget,
+        QTableWidgetItem,
         QVBoxLayout,
         QWidget,
     )
@@ -283,8 +341,279 @@ def run_gui(args: argparse.Namespace) -> int:
         progress = Signal(int)
         finished = Signal(bool, str)
 
+    class TransactionSignals(QObject):
+        loaded = Signal(object)
+        failed = Signal(str)
+
+    class TransactionDialog(QDialog):
+        def __init__(self, server_url: str, parent: QWidget) -> None:
+            super().__init__(parent)
+            self._server_url = server_url.rstrip("/")
+            self._loading = False
+            self._load_thread: threading.Thread | None = None
+            self._signals = TransactionSignals()
+            self._signals.loaded.connect(self._show_transactions)
+            self._signals.failed.connect(self._show_error)
+            self.setWindowTitle("Database Transactions")
+            self.resize(1200, 650)
+
+            layout = QVBoxLayout(self)
+            heading_row = QHBoxLayout()
+            heading = QLabel("Inspection Transactions (newest first)")
+            heading.setStyleSheet("font-size: 17px; font-weight: 700;")
+            self._status = QLabel("Loading...")
+            self._status.setStyleSheet("color: #8d98a8;")
+            self._refresh_button = QPushButton("Refresh")
+            self._refresh_button.clicked.connect(self.load_transactions)
+            heading_row.addWidget(heading)
+            heading_row.addWidget(self._status, 1)
+            heading_row.addWidget(self._refresh_button)
+            layout.addLayout(heading_row)
+
+            headers = (
+                "Timestamp",
+                "Camera",
+                "Event Type",
+                "OCR / Captured Data",
+                "Status",
+                "Confidence",
+                "Event ID",
+            )
+            self._table = QTableWidget(0, len(headers))
+            self._table.setHorizontalHeaderLabels(headers)
+            self._table.setEditTriggers(
+                QTableWidget.EditTrigger.NoEditTriggers
+            )
+            self._table.setSelectionBehavior(
+                QTableWidget.SelectionBehavior.SelectRows
+            )
+            self._table.setAlternatingRowColors(True)
+            self._table.setSortingEnabled(True)
+            table_header = self._table.horizontalHeader()
+            table_header.setSectionResizeMode(
+                QHeaderView.ResizeMode.ResizeToContents
+            )
+            table_header.setSectionResizeMode(
+                3,
+                QHeaderView.ResizeMode.Stretch,
+            )
+            layout.addWidget(self._table, 1)
+
+            close_buttons = QDialogButtonBox(
+                QDialogButtonBox.StandardButton.Close
+            )
+            close_buttons.rejected.connect(self.reject)
+            layout.addWidget(close_buttons)
+            self.load_transactions()
+
+        def load_transactions(self) -> None:
+            if self._loading:
+                return
+            self._loading = True
+            self._refresh_button.setEnabled(False)
+            self._status.setText("Loading...")
+            self._load_thread = threading.Thread(
+                target=self._fetch_transactions,
+                name="GibraltarTransactionLoader",
+                daemon=True,
+            )
+            self._load_thread.start()
+
+        def _fetch_transactions(self) -> None:
+            try:
+                import requests
+
+                response = requests.get(
+                    f"{self._server_url}/api/inspections",
+                    params={"limit": 500},
+                    timeout=10,
+                )
+                response.raise_for_status()
+                payload = response.json()
+                records = payload.get("data", [])
+                if not isinstance(records, list):
+                    raise ValueError("Invalid transaction response from backend")
+                records.sort(
+                    key=lambda record: str(record.get("timestamp", "")),
+                    reverse=True,
+                )
+                self._signals.loaded.emit(records)
+            except requests.ConnectionError:
+                self._signals.failed.emit(
+                    "Cannot connect to the Gibraltar backend at "
+                    f"{self._server_url}. Start it with: node server.js"
+                )
+            except requests.Timeout:
+                self._signals.failed.emit(
+                    "The backend did not respond in time. Please try again."
+                )
+            except requests.HTTPError as error:
+                self._signals.failed.emit(
+                    f"The backend returned HTTP {error.response.status_code}."
+                )
+            except (requests.RequestException, ValueError) as error:
+                self._signals.failed.emit(str(error))
+
+        def _show_transactions(self, records: object) -> None:
+            self._loading = False
+            self._refresh_button.setEnabled(True)
+            if not isinstance(records, list):
+                self._show_error("Invalid transaction data")
+                return
+            self._table.setSortingEnabled(False)
+            self._table.setRowCount(len(records))
+            for row, record in enumerate(records):
+                captured_data = record.get("captured_data")
+                if isinstance(captured_data, dict):
+                    captured_text = str(captured_data.get("ocr_text", ""))
+                elif captured_data is None:
+                    captured_text = ""
+                else:
+                    captured_text = str(captured_data)
+                values = (
+                    record.get("timestamp", ""),
+                    record.get("camera_id", ""),
+                    record.get("event_type", ""),
+                    captured_text,
+                    record.get("status", ""),
+                    record.get("confidence", ""),
+                    record.get("event_id", ""),
+                )
+                for column, value in enumerate(values):
+                    self._table.setItem(
+                        row,
+                        column,
+                        QTableWidgetItem(str(value)),
+                    )
+            self._table.setSortingEnabled(True)
+            self._table.sortItems(0, Qt.SortOrder.DescendingOrder)
+            self._status.setText(f"{len(records)} transaction(s)")
+
+        def _show_error(self, message: str) -> None:
+            self._loading = False
+            self._refresh_button.setEnabled(True)
+            self._status.setText("Could not load transactions")
+            QMessageBox.warning(self, "Database Transactions", message)
+
+    class CameraSettingsDialog(QDialog):
+        def __init__(
+            self,
+            camera_sources: list[dict[str, str]],
+            parent: QWidget,
+        ) -> None:
+            super().__init__(parent)
+            self.setWindowTitle("Camera Source Settings")
+            self.setMinimumWidth(680)
+            layout = QVBoxLayout(self)
+            instruction = QLabel(
+                "Choose RTSP or USB independently for each camera window, "
+                "then enter its URL or USB device index."
+            )
+            instruction.setWordWrap(True)
+            layout.addWidget(instruction)
+            form = QFormLayout()
+            self._source_types: list[QComboBox] = []
+            self._source_fields: list[QLineEdit] = []
+            for index, camera_source in enumerate(camera_sources, start=1):
+                source_type = QComboBox()
+                source_type.addItem("RTSP Camera", "rtsp")
+                source_type.addItem("USB Camera", "usb")
+                selected_type = camera_source.get("type", "rtsp")
+                source_type.setCurrentIndex(1 if selected_type == "usb" else 0)
+                field = QLineEdit(camera_source.get("value", ""))
+                field.setClearButtonEnabled(True)
+                row = QWidget()
+                row_layout = QHBoxLayout(row)
+                row_layout.setContentsMargins(0, 0, 0, 0)
+                row_layout.addWidget(source_type)
+                row_layout.addWidget(field, 1)
+                form.addRow(f"Camera {index} source:", row)
+                self._source_types.append(source_type)
+                self._source_fields.append(field)
+                source_type.currentIndexChanged.connect(
+                    lambda _index, combo=source_type, editor=field: (
+                        self._update_source_field(combo, editor)
+                    )
+                )
+                self._update_source_field(source_type, field)
+            layout.addLayout(form)
+            buttons = QDialogButtonBox(
+                QDialogButtonBox.StandardButton.Save
+                | QDialogButtonBox.StandardButton.Cancel
+            )
+            buttons.accepted.connect(self._validate_and_accept)
+            buttons.rejected.connect(self.reject)
+            layout.addWidget(buttons)
+
+        @property
+        def camera_sources(self) -> list[dict[str, str]]:
+            return [
+                {
+                    "type": str(source_type.currentData()),
+                    "value": field.text().strip(),
+                }
+                for source_type, field in zip(
+                    self._source_types,
+                    self._source_fields,
+                )
+            ]
+
+        @staticmethod
+        def _update_source_field(
+            source_type: QComboBox,
+            field: QLineEdit,
+        ) -> None:
+            if source_type.currentData() == "usb":
+                field.setPlaceholderText("USB device index, for example 0")
+            else:
+                field.setPlaceholderText("rtsp://username:password@camera/stream")
+
+        def _validate_and_accept(self) -> None:
+            camera_sources = self.camera_sources
+            invalid_rtsp = [
+                str(index)
+                for index, source in enumerate(camera_sources, start=1)
+                if source["type"] == "rtsp"
+                and source["value"]
+                and not source["value"].lower().startswith(("rtsp://", "rtsps://"))
+            ]
+            if invalid_rtsp:
+                QMessageBox.warning(
+                    self,
+                    "Invalid Camera URL",
+                    "Enter an rtsp:// or rtsps:// URL for camera(s): "
+                    + ", ".join(invalid_rtsp),
+                )
+                return
+            invalid_usb = []
+            for index, source in enumerate(camera_sources, start=1):
+                if source["type"] != "usb" or not source["value"]:
+                    continue
+                try:
+                    valid = int(source["value"]) >= 0
+                except ValueError:
+                    valid = False
+                if not valid:
+                    invalid_usb.append(str(index))
+            if invalid_usb:
+                QMessageBox.warning(
+                    self,
+                    "Invalid USB Camera",
+                    "Enter a non-negative USB device index for camera(s): "
+                    + ", ".join(invalid_usb),
+                )
+                return
+            if not any(source["value"] for source in camera_sources):
+                QMessageBox.warning(
+                    self,
+                    "Camera Source Required",
+                    "Configure at least one RTSP or USB camera.",
+                )
+                return
+            self.accept()
+
     class CameraPanel(QFrame):
-        match_detected = Signal(str, float, str)
+        match_detected = Signal(str, float, str, object)
 
         def __init__(
             self,
@@ -298,12 +627,16 @@ def run_gui(args: argparse.Namespace) -> int:
             self._snapshot_dir = repository_root / camera_name
             self._snapshot_dir.mkdir(parents=True, exist_ok=True)
             self._latest_jpeg: bytes | None = None
+            self._latest_metadata: dict[str, Any] = {}
             self._model_feature: np.ndarray | None = None
             self._match_threshold = 0.75
             self._match_frame_counter = 0
             self._match_event_cooldown = match_event_cooldown
             self._last_match_event_time = 0.0
             self._previously_matched = False
+            self._ocr_collection_started: float | None = None
+            self._best_ocr_metadata: dict[str, Any] = {}
+            self._best_ocr_text = ""
             self._training_thread: threading.Thread | None = None
             self._training_signals = TrainingSignals()
             self._training_signals.progress.connect(
@@ -398,12 +731,17 @@ def run_gui(args: argparse.Namespace) -> int:
                 "color: #ff6b6b;" if error else "color: #8d98a8;"
             )
 
-        def show_jpeg(self, data: bytes) -> None:
+        def show_jpeg(
+            self,
+            data: bytes,
+            metadata: dict[str, Any] | None = None,
+        ) -> None:
             image = QImage.fromData(data, "JPG")
             if image.isNull():
                 self.show_message("Invalid frame received", error=True)
                 return
             self._latest_jpeg = data
+            self._latest_metadata = metadata or {}
             self.save_button.setEnabled(True)
             self.video.setPixmap(
                 QPixmap.fromImage(image).scaled(
@@ -437,12 +775,33 @@ def run_gui(args: argparse.Namespace) -> int:
                         or now - self._last_match_event_time
                         >= self._match_event_cooldown
                     ):
-                        self._last_match_event_time = now
-                        self.match_detected.emit(
-                            self._camera_name,
-                            similarity,
-                            str(self._model_path),
+                        ocr_data = self._latest_metadata.get("ocr", {})
+                        captured_text = (
+                            str(ocr_data.get("text", "")).strip()
+                            if isinstance(ocr_data, dict)
+                            else ""
                         )
+                        if captured_text:
+                            if self._ocr_collection_started is None:
+                                self._ocr_collection_started = now
+                            if len(captured_text) > len(self._best_ocr_text):
+                                self._best_ocr_text = captured_text
+                                self._best_ocr_metadata = self._latest_metadata
+                            if now - self._ocr_collection_started >= 1.0:
+                                self._last_match_event_time = now
+                                self.match_detected.emit(
+                                    self._camera_name,
+                                    similarity,
+                                    str(self._model_path),
+                                    self._best_ocr_metadata,
+                                )
+                                self._ocr_collection_started = None
+                                self._best_ocr_metadata = {}
+                                self._best_ocr_text = ""
+                        else:
+                            self.show_message(
+                                "Matched; waiting for captured OCR text"
+                            )
                     self._previously_matched = True
                 else:
                     self.match_badge.setText(
@@ -452,6 +811,9 @@ def run_gui(args: argparse.Namespace) -> int:
                         "color: #ff5f65; font-size: 17px; font-weight: 800;"
                     )
                     self._previously_matched = False
+                    self._ocr_collection_started = None
+                    self._best_ocr_metadata = {}
+                    self._best_ocr_text = ""
 
         def save_snapshot(self) -> None:
             if self._latest_jpeg is None:
@@ -581,6 +943,7 @@ def run_gui(args: argparse.Namespace) -> int:
                     os.getenv("SOCKET_SERVER_URL", "http://127.0.0.1:3000"),
                 )
             )
+            self._server_url = server_url
             self._socket_client = SocketClient(server_url)
             self._inspection_sender = InspectionSender(
                 self._socket_client,
@@ -595,16 +958,8 @@ def run_gui(args: argparse.Namespace) -> int:
                 daemon=True,
             )
             self._database_connect_thread.start()
-            self._camera = LocalCamera(
-                args.camera,
-                width=args.width,
-                height=args.height,
-                fps=args.fps,
-            )
-            try:
-                self._camera.open()
-            except ConnectionError:
-                pass
+            self._camera_sources = load_camera_sources()
+            self._cameras: list[RTSPCamera | LocalCamera | None] = [None, None, None]
 
             root = QWidget()
             root.setStyleSheet("background: #0f1217;")
@@ -631,9 +986,25 @@ def run_gui(args: argparse.Namespace) -> int:
             select_repository_button.clicked.connect(
                 self._select_repository_path
             )
+            camera_settings_button = QPushButton("Select Camera Source")
+            camera_settings_button.setStyleSheet(
+                select_repository_button.styleSheet()
+            )
+            camera_settings_button.clicked.connect(
+                self._open_camera_settings
+            )
+            transactions_button = QPushButton("View Transactions")
+            transactions_button.setStyleSheet(
+                select_repository_button.styleSheet()
+            )
+            transactions_button.clicked.connect(
+                self._open_transactions
+            )
             repository_layout.addWidget(repository_title)
             repository_layout.addWidget(self._repository_path_label, 1)
             repository_layout.addWidget(select_repository_button)
+            repository_layout.addWidget(camera_settings_button)
+            repository_layout.addWidget(transactions_button)
             layout.addWidget(repository_bar, 0, 0, 1, 3)
 
             specifications = (
@@ -654,7 +1025,8 @@ def run_gui(args: argparse.Namespace) -> int:
                     self._repository_root,
                     self._match_event_cooldown,
                 )
-                panel.match_detected.connect(self._record_match)
+                if column == 0:
+                    panel.match_detected.connect(self._record_ocr_match)
                 layout.addWidget(panel, 1, column)
                 self._panels.append(panel)
                 input_queue = context.Queue(maxsize=1)
@@ -676,39 +1048,46 @@ def run_gui(args: argparse.Namespace) -> int:
                 self._output_queues.append(output_queue)
                 self._workers.append(worker)
 
-            if not self._camera.is_opened:
-                for panel in self._panels:
-                    panel.video.setText("Camera unavailable")
-                    panel.show_message(
-                        f"Could not open built-in camera {args.camera}",
-                        error=True,
-                    )
+            self._connect_cameras()
 
             self._timer = QTimer(self)
             self._timer.timeout.connect(self._update)
             self._timer.start(max(1, round(1000 / args.fps)))
 
-        def _record_match(
+        def _record_ocr_match(
             self,
             camera_name: str,
             similarity: float,
             model_path: str,
+            metadata: object,
         ) -> None:
-            """Send one positive match to the existing inspection backend."""
+            """Save a positive Camera 1 OCR match through the backend."""
+            ocr_data: dict[str, Any] = {}
+            if isinstance(metadata, dict):
+                candidate = metadata.get("ocr", {})
+                if isinstance(candidate, dict):
+                    ocr_data = candidate
+            captured_text = " | ".join(
+                line.strip()
+                for line in str(ocr_data.get("text", "")).splitlines()
+                if line.strip()
+            )
+            if not captured_text:
+                panel_index = int(camera_name.rsplit("-", 1)[-1]) - 1
+                if 0 <= panel_index < len(self._panels):
+                    self._panels[panel_index].show_message(
+                        "Database save skipped: no OCR text captured",
+                        error=True,
+                    )
+                return
             result = self._inspection_sender.send_pass(
                 camera_id=camera_name,
                 section_id=camera_name.upper(),
-                event_type="trained_model_match",
-                captured_data={
-                    "matched": True,
-                    "similarity": round(similarity, 4),
-                    "database": self._database_name,
-                    "table": self._database_table,
-                    "model_path": model_path,
-                },
+                event_type="ocr_trained_model_match",
+                captured_data=captured_text,
                 confidence=round(similarity, 4),
                 evidence_link=model_path,
-                comments="Live frame matched the trained camera model",
+                comments="Camera 1 OCR frame matched the trained model",
                 remarks="Automatically generated by Gibraltar Visual AI",
             )
             panel_index = int(camera_name.rsplit("-", 1)[-1]) - 1
@@ -719,7 +1098,7 @@ def run_gui(args: argparse.Namespace) -> int:
                     )
                 else:
                     self._panels[panel_index].show_message(
-                        "Match detected; database backend is disconnected",
+                        "Match queued; waiting for database connection",
                         error=True,
                     )
 
@@ -747,20 +1126,85 @@ def run_gui(args: argparse.Namespace) -> int:
             self._repository_root = repository_root
             self._repository_path_label.setText(str(repository_root))
 
+        def _open_camera_settings(self) -> None:
+            dialog = CameraSettingsDialog(self._camera_sources, self)
+            if dialog.exec() != QDialog.DialogCode.Accepted:
+                return
+            camera_sources = dialog.camera_sources
+            try:
+                save_camera_sources(camera_sources)
+            except OSError as error:
+                QMessageBox.critical(
+                    self,
+                    "Camera Settings",
+                    f"Could not save camera sources: {error}",
+                )
+                return
+            self._camera_sources = camera_sources
+            self._connect_cameras()
+
+        def _open_transactions(self) -> None:
+            dialog = TransactionDialog(self._server_url, self)
+            dialog.exec()
+
+        def _connect_cameras(self) -> None:
+            for camera in self._cameras:
+                if camera is not None:
+                    camera.release()
+            self._cameras = [None, None, None]
+
+            for index, (camera_source, panel) in enumerate(
+                zip(self._camera_sources, self._panels)
+            ):
+                panel.video.clear()
+                panel.save_button.setEnabled(False)
+                source_value = camera_source["value"]
+                if not source_value:
+                    panel.video.setText(f"Camera {index + 1} not configured")
+                    panel.show_message(
+                        "Use Select Camera Source to configure this camera",
+                        error=True,
+                    )
+                    continue
+                panel.video.setText(f"Connecting Camera {index + 1}...")
+                if camera_source["type"] == "usb":
+                    camera = LocalCamera(
+                        int(source_value),
+                        width=args.width,
+                        height=args.height,
+                        fps=args.fps,
+                    )
+                    source_label = f"USB {source_value}"
+                else:
+                    camera = RTSPCamera(source_value)
+                    source_label = "RTSP"
+                self._cameras[index] = camera
+                try:
+                    camera.open()
+                except ConnectionError as error:
+                    panel.video.setText(f"Camera {index + 1} unavailable")
+                    panel.show_message(str(error), error=True)
+                else:
+                    panel.show_message(
+                        f"Camera {index + 1} ({source_label}) connected; waiting for frame"
+                    )
+
         def _update(self) -> None:
             if shutdown_requested.is_set():
                 self.close()
                 return
 
-            if self._camera.is_opened:
-                ok, frame = self._camera.read()
+            for camera, panel, input_queue in zip(
+                self._cameras,
+                self._panels,
+                self._input_queues,
+            ):
+                if camera is None:
+                    continue
+                ok, frame = camera.read_latest()
                 if ok:
                     encoded = encode_frame(frame)
-                    for input_queue in self._input_queues:
-                        latest_put(input_queue, encoded)
-                else:
-                    for panel in self._panels:
-                        panel.show_message("Camera frame unavailable", error=True)
+                    latest_put(input_queue, encoded)
 
             for panel, output_queue, worker in zip(
                 self._panels,
@@ -776,7 +1220,8 @@ def run_gui(args: argparse.Namespace) -> int:
                 if latest is not None:
                     message_type, payload = latest
                     if message_type == "frame":
-                        panel.show_jpeg(payload)
+                        frame_data, metadata = payload
+                        panel.show_jpeg(frame_data, metadata)
                     else:
                         panel.show_message(
                             payload,
@@ -793,7 +1238,9 @@ def run_gui(args: argparse.Namespace) -> int:
                 return
             self._stopping = True
             self._timer.stop()
-            self._camera.release()
+            for camera in self._cameras:
+                if camera is not None:
+                    camera.release()
             self._stop_event.set()
             self._socket_client.disconnect()
 
