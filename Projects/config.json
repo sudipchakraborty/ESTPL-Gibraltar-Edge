@@ -10,16 +10,16 @@
     },
     "camera_sources": [
         {
-            "type": "usb",
-            "value": "0"
+            "type": "rtsp",
+            "value": "rtsp://192.168.0.10:8554/gibpi2"
         },
         {
             "type": "rtsp",
-            "value": ""
+            "value": "rtsp://192.168.0.9:8554/gibpi1"
         },
         {
             "type": "rtsp",
-            "value": ""
+            "value": "rtsp://192.168.0.8:8554/gibpi3"
         }
     ]
 }
