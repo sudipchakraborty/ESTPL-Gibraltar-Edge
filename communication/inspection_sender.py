@@ -121,6 +121,8 @@ class InspectionSender:
 
         evidence_link=None,
 
+        evidence_image=None,
+
         comments=None,
 
         remarks=None,
@@ -239,6 +241,9 @@ class InspectionSender:
 
                 "evidence_link":
                     evidence_link,
+
+                "evidence_image":
+                    evidence_image,
 
                 "comments":
                     comments,
