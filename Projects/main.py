@@ -775,33 +775,13 @@ def run_gui(args: argparse.Namespace) -> int:
                         or now - self._last_match_event_time
                         >= self._match_event_cooldown
                     ):
-                        ocr_data = self._latest_metadata.get("ocr", {})
-                        captured_text = (
-                            str(ocr_data.get("text", "")).strip()
-                            if isinstance(ocr_data, dict)
-                            else ""
+                        self._last_match_event_time = now
+                        self.match_detected.emit(
+                            self._camera_name,
+                            similarity,
+                            str(self._model_path),
+                            self._latest_metadata,
                         )
-                        if captured_text:
-                            if self._ocr_collection_started is None:
-                                self._ocr_collection_started = now
-                            if len(captured_text) > len(self._best_ocr_text):
-                                self._best_ocr_text = captured_text
-                                self._best_ocr_metadata = self._latest_metadata
-                            if now - self._ocr_collection_started >= 1.0:
-                                self._last_match_event_time = now
-                                self.match_detected.emit(
-                                    self._camera_name,
-                                    similarity,
-                                    str(self._model_path),
-                                    self._best_ocr_metadata,
-                                )
-                                self._ocr_collection_started = None
-                                self._best_ocr_metadata = {}
-                                self._best_ocr_text = ""
-                        else:
-                            self.show_message(
-                                "Matched; waiting for captured OCR text"
-                            )
                     self._previously_matched = True
                 else:
                     self.match_badge.setText(
@@ -958,6 +938,7 @@ def run_gui(args: argparse.Namespace) -> int:
                 daemon=True,
             )
             self._database_connect_thread.start()
+            self._send_startup_test_transactions()
             self._camera_sources = load_camera_sources()
             self._cameras: list[RTSPCamera | LocalCamera | None] = [None, None, None]
 
@@ -1025,8 +1006,7 @@ def run_gui(args: argparse.Namespace) -> int:
                     self._repository_root,
                     self._match_event_cooldown,
                 )
-                if column == 0:
-                    panel.match_detected.connect(self._record_ocr_match)
+                panel.match_detected.connect(self._record_camera_match)
                 layout.addWidget(panel, 1, column)
                 self._panels.append(panel)
                 input_queue = context.Queue(maxsize=1)
@@ -1054,14 +1034,28 @@ def run_gui(args: argparse.Namespace) -> int:
             self._timer.timeout.connect(self._update)
             self._timer.start(max(1, round(1000 / args.fps)))
 
-        def _record_ocr_match(
+        def _send_startup_test_transactions(self) -> None:
+            """Send ten pipeline-test records once when this Edge process starts."""
+            for index in range(1, 11):
+                self._inspection_sender.send(
+                    camera_id="EDGE-STARTUP-TEST",
+                    section_id="PIPELINE-TEST",
+                    event_type="edge_startup_pipeline_test",
+                    status="PASS",
+                    captured_data=f"DUMMY-TRANSACTION-{index:02d}",
+                    confidence=1.0,
+                    comments="Dummy Edge-to-database pipeline test",
+                    remarks=f"Startup test record {index} of 10",
+                )
+
+        def _record_camera_match(
             self,
             camera_name: str,
             similarity: float,
             model_path: str,
             metadata: object,
         ) -> None:
-            """Save a positive Camera 1 OCR match through the backend."""
+            """Save a positive trained-model match from any camera."""
             ocr_data: dict[str, Any] = {}
             if isinstance(metadata, dict):
                 candidate = metadata.get("ocr", {})
@@ -1072,22 +1066,21 @@ def run_gui(args: argparse.Namespace) -> int:
                 for line in str(ocr_data.get("text", "")).splitlines()
                 if line.strip()
             )
-            if not captured_text:
-                panel_index = int(camera_name.rsplit("-", 1)[-1]) - 1
-                if 0 <= panel_index < len(self._panels):
-                    self._panels[panel_index].show_message(
-                        "Database save skipped: no OCR text captured",
-                        error=True,
-                    )
-                return
+            captured_data: dict[str, Any] = {
+                "matched": True,
+                "similarity": round(similarity, 4),
+                "model_path": model_path,
+            }
+            if captured_text:
+                captured_data["ocr_text"] = captured_text
             result = self._inspection_sender.send_pass(
                 camera_id=camera_name,
                 section_id=camera_name.upper(),
-                event_type="ocr_trained_model_match",
-                captured_data=captured_text,
+                event_type="trained_model_match",
+                captured_data=captured_data,
                 confidence=round(similarity, 4),
                 evidence_link=model_path,
-                comments="Camera 1 OCR frame matched the trained model",
+                comments=f"{camera_name} frame matched the trained model",
                 remarks="Automatically generated by Gibraltar Visual AI",
             )
             panel_index = int(camera_name.rsplit("-", 1)[-1]) - 1
@@ -1275,7 +1268,7 @@ def run_gui(args: argparse.Namespace) -> int:
     application = QApplication(sys.argv)
     window = GibraltarWindow()
     application.aboutToQuit.connect(window.shutdown)
-    window.show()
+    window.showMaximized()
     try:
         return application.exec()
     except KeyboardInterrupt:

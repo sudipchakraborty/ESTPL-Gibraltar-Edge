@@ -203,6 +203,12 @@ cython_debug/
 # Temporary file for partial code execution
 tempCodeRunnerFile.py
 
+# Local deployment environment and runtime data
+.venv/
+.runtime/
+runtime/
+Ultralytics/
+
 # Ruff stuff:
 .ruff_cache/
 

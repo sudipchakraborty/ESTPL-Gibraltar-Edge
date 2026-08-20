@@ -221,7 +221,12 @@ class InspectionSender:
                     camera_id,
 
                 "captured_data":
-                    captured_data,
+                    (
+                        captured_data
+                        if isinstance(captured_data, (dict, list))
+                        or captured_data is None
+                        else {"value": captured_data}
+                    ),
 
                 "event_id":
                     event_id,

@@ -1,5 +1,5 @@
 {
-    "image_repository_path": "D:\\ESTPL\\Saved_Image_Gibraltar",
+    "image_repository_path": "C:\\Users\\Administrator\\Documents\\ESTPL-Gibraltar-Edge\\runtime\\Saved_Image_Gibraltar",
     "database": {
         "name": "gibraltar",
         "table": "inspection_records",
