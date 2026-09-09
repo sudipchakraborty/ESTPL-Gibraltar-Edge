@@ -1,5 +1,8 @@
 import asyncio
 import logging
+import time
+from fractions import Fraction
+import cv2
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from aiortc import (RTCPeerConnection, RTCSessionDescription,VideoStreamTrack)
@@ -13,10 +16,14 @@ logger = logging.getLogger("DeepVision-WebRTC")
 
 class CameraVideoTrack(VideoStreamTrack):
 
-    def __init__(self,camera_processor,camera_id):
+    def __init__(self,camera_processor,camera_id,fps=10,target_width=960):
         super().__init__()
         self.camera_processor = camera_processor
         self.camera_id = camera_id
+        self.fps = max(1.0, float(fps))
+        self.target_width = max(320, int(target_width))
+        self._pts = 0
+        self._next_frame_at = time.monotonic()
         
     async def recv(self):
 
@@ -24,7 +31,13 @@ class CameraVideoTrack(VideoStreamTrack):
         # Generate WebRTC timestamp
         # -------------------------------------------------
 
-        pts, time_base = await self.next_timestamp()
+        delay = self._next_frame_at - time.monotonic()
+        if delay > 0:
+            await asyncio.sleep(delay)
+        self._next_frame_at = max(self._next_frame_at + 1 / self.fps, time.monotonic())
+        pts = self._pts
+        time_base = Fraction(1, 90_000)
+        self._pts += round(90_000 / self.fps)
 
 
         # -------------------------------------------------
@@ -55,6 +68,11 @@ class CameraVideoTrack(VideoStreamTrack):
         # Convert OpenCV BGR frame to WebRTC VideoFrame
         # -------------------------------------------------
 
+        height, width = frame.shape[:2]
+        if width > self.target_width:
+            target_height = max(2, round(height * self.target_width / width))
+            frame = cv2.resize(frame, (self.target_width, target_height), interpolation=cv2.INTER_AREA)
+
         video_frame = VideoFrame.from_ndarray(
 
             frame,
@@ -84,7 +102,9 @@ class WebRTCServer:
 
     def __init__(
         self,
-        camera_processors
+        camera_processors,
+        fps=10,
+        target_width=960,
     ):
 
         """
@@ -105,6 +125,8 @@ class WebRTCServer:
         self.camera_processors = (
             camera_processors
         )
+        self.fps = fps
+        self.target_width = target_width
 
 
         # -------------------------------------------------
@@ -480,7 +502,11 @@ class WebRTCServer:
 
                         camera_id
 
-                    )
+                    ),
+
+                    fps=self.fps,
+
+                    target_width=self.target_width,
 
                 )
 

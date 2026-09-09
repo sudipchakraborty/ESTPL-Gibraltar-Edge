@@ -8,6 +8,12 @@
         "section_id": "VISUAL-AI",
         "match_event_cooldown_seconds": 30
     },
+    "rtsp_transport": "udp",
+    "webrtc": {
+        "port": 8000,
+        "fps": 30,
+        "target_width": 640
+    },
     "camera_sources": [
         {
             "type": "usb",

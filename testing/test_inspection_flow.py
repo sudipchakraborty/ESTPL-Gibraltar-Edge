@@ -3,6 +3,7 @@
 Run: .venv/Scripts/python.exe -m unittest testing.test_inspection_flow -v
 """
 import ast
+import base64
 import json
 import os
 from pathlib import Path
@@ -163,12 +164,20 @@ class InspectionFlowTests(unittest.TestCase):
         sender = SimpleNamespace(send_pass=Mock(return_value={"success": True, "event_id": "test"}),
                                  send_fail=Mock(return_value={"success": True, "event_id": "test"}))
         window_stub = SimpleNamespace(_inspection_sender=sender, _panels=[Mock(), Mock(), Mock()])
+        window_stub._panels[2]._ocr_frame = self.frame.copy()
+        window_stub._panels[2]._latest_jpeg = app_module.encode_frame(np.zeros_like(self.frame))
         namespace["_record_camera_inspection"](window_stub, "camera-3", False, .4, "object_references.json", self.metadata(3))
         payload = sender.send_fail.call_args.kwargs
         self.assertEqual(payload["event_type"], "object_match")
         self.assertEqual(payload["camera_id"], "camera-3")
         self.assertEqual(payload["captured_data"]["objects"][0]["class_name"], "bottle")
         self.assertNotIn("feature", payload["captured_data"]["objects"][0])
+        self.assertEqual(payload["evidence_image"]["content_type"], "image/jpeg")
+        evidence = base64.b64decode(payload["evidence_image"]["data"])
+        self.assertEqual(evidence, app_module.encode_frame(self.frame))
+        self.assertNotIn("evidence_link", payload)
+        namespace["_record_camera_inspection"](window_stub, "camera-3", True, .99, "object_references.json", self.metadata(3))
+        self.assertEqual(sender.send_pass.call_args.kwargs["evidence_image"], payload["evidence_image"])
 
     def test_detector_emits_features_from_unannotated_object_crop(self):
         detector = Mock()

@@ -34,7 +34,9 @@ if str(REPOSITORY_DIR) not in sys.path:
 
 from camera import LocalCamera, RTSPCamera  # noqa: E402
 from communication.inspection_sender import InspectionSender  # noqa: E402
+from communication.evidence import jpeg_evidence  # noqa: E402
 from communication.socket_client import SocketClient  # noqa: E402
+from communication.webrtc_service import MultiCameraWebRTCService  # noqa: E402
 
 
 def load_project_config() -> dict[str, Any]:
@@ -1897,6 +1899,7 @@ def run_gui(args: argparse.Namespace) -> int:
             self._stopping = False
             self._stop_event = context.Event()
             project_config = load_project_config()
+            self._rtsp_transport = str(project_config.get("rtsp_transport", "udp")).lower()
             self._audio_alert_manager = AudioAlertManager(
                 AudioAlertConfigStore(CONFIG_PATH)
             )
@@ -1926,6 +1929,14 @@ def run_gui(args: argparse.Namespace) -> int:
                     database_config.get("section_id", "VISUAL-AI")
                 ),
             )
+            webrtc_config = project_config.get("webrtc", {})
+            self._webrtc_service = MultiCameraWebRTCService(
+                ["camera-1", "camera-2", "camera-3"],
+                port=int(webrtc_config.get("port", 8000)),
+                fps=float(webrtc_config.get("fps", 10)),
+                target_width=int(webrtc_config.get("target_width", 960)),
+            )
+            self._webrtc_service.start()
             self._database_connect_thread = threading.Thread(
                 target=self._socket_client.connect,
                 name="GibraltarDatabaseConnection",
@@ -2137,13 +2148,21 @@ def run_gui(args: argparse.Namespace) -> int:
                 if matched
                 else self._inspection_sender.send_fail
             )
+            panel_index = int(camera_name.rsplit("-", 1)[-1]) - 1
+            panel = self._panels[panel_index]
+            evidence_frame = panel._ocr_frame
+            evidence_jpeg = (
+                encode_frame(evidence_frame)
+                if evidence_frame is not None
+                else panel._latest_jpeg
+            )
             result = send_result(
                 camera_id=camera_name,
                 section_id=camera_name.upper(),
                 event_type=inspection_kind,
                 captured_data=captured_data,
                 confidence=round(similarity, 4),
-                evidence_link=model_path,
+                evidence_image=jpeg_evidence(evidence_jpeg),
                 comments=(
                     f"{camera_name} {inspection_kind} matched"
                     if matched
@@ -2266,7 +2285,10 @@ def run_gui(args: argparse.Namespace) -> int:
                         f"USB {source_value} | {usb_width}x{usb_height}"
                     )
                 else:
-                    camera = RTSPCamera(source_value)
+                    camera = RTSPCamera(
+                        source_value,
+                        transport=self._rtsp_transport,
+                    )
                     source_label = "RTSP"
                 self._cameras[index] = camera
                 try:
@@ -2304,6 +2326,7 @@ def run_gui(args: argparse.Namespace) -> int:
                         )
                     draw_overlay = draw_ocr_overlay if camera_index == 0 else draw_object_overlay
                     display_frame = draw_overlay(frame, self._latest_analysis_metadata[camera_index], panel.roi)
+                    self._webrtc_service.publish(panel._camera_name, display_frame)
                     panel.show_jpeg(encode_frame(display_frame), self._latest_analysis_metadata[camera_index], inspection_frame=frame)
                     if panel.ocr_capture_submitted or not panel._awaiting_ocr:
                         continue
@@ -2351,6 +2374,7 @@ def run_gui(args: argparse.Namespace) -> int:
                 if camera is not None:
                     camera.release()
             self._stop_event.set()
+            self._webrtc_service.close()
             self._socket_client.disconnect()
 
             # Wake workers immediately instead of waiting for Queue.get()
