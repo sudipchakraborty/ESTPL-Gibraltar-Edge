@@ -83,6 +83,25 @@
     "camera_1_inspection": {
         "placement_wait_seconds": 2.0,
         "match_score_threshold": 0.85,
-        "ocr_confidence_threshold": 0.85
+        "ocr_confidence_threshold": 0.85,
+        "placement_confirm_readings": 3,
+        "placement_confirm_seconds": 0.6,
+        "placement_min_text_length": 2
+    },
+    "camera_2_inspection": {
+        "placement_wait_seconds": 2.0,
+        "match_score_threshold": 0.85,
+        "object_confidence_threshold": 0.6,
+        "placement_confirm_readings": 3,
+        "placement_confirm_seconds": 0.6,
+        "placement_min_text_length": 1
+    },
+    "camera_3_inspection": {
+        "placement_wait_seconds": 2.0,
+        "match_score_threshold": 0.85,
+        "object_confidence_threshold": 0.6,
+        "placement_confirm_readings": 3,
+        "placement_confirm_seconds": 0.6,
+        "placement_min_text_length": 1
     }
 }

@@ -327,7 +327,7 @@ def create_ocr_processor(
 
 def create_detection_processor(
     device: str,
-) -> Callable[[np.ndarray], np.ndarray]:
+) -> Callable[[np.ndarray], dict[str, Any]]:
     from models.detector import ObjectDetector
 
     detector = ObjectDetector(
@@ -335,24 +335,43 @@ def create_detection_processor(
         device=device,
     )
 
-    def process(frame: np.ndarray) -> np.ndarray:
+    def process(frame: np.ndarray) -> dict[str, Any]:
         started = time.perf_counter()
-        detections, results = detector.detect(frame)
-        output = detector.draw(frame, results)
-        elapsed_ms = (time.perf_counter() - started) * 1000.0
-        cv2.putText(
-            output,
-            f"Objects {len(detections)} | {elapsed_ms:.0f} ms",
-            (10, 28),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.65,
-            (0, 255, 255),
-            2,
-            cv2.LINE_AA,
-        )
-        return output
+        detections, _results = detector.detect(frame)
+        height, width = frame.shape[:2]
+        valid = []
+        for detection in detections:
+            x1, y1, x2, y2 = detection["bbox"]
+            x1, x2 = max(0, x1), min(width, x2)
+            y1, y2 = max(0, y1), min(height, y2)
+            if x2 <= x1 or y2 <= y1:
+                continue
+            valid.append({
+                **detection,
+                "bbox": [x1, y1, x2, y2],
+                "feature": extract_visual_feature(frame[y1:y2, x1:x2]).tolist(),
+            })
+        return {"objects": valid, "image_width": width, "image_height": height,
+                "inference_time_ms": (time.perf_counter() - started) * 1000.0}
 
     return process
+
+
+def draw_object_overlay(frame: np.ndarray, metadata: dict[str, Any], roi: list[float] | None) -> np.ndarray:
+    output = frame.copy()
+    height, width = frame.shape[:2]
+    left, top, roi_width, roi_height = roi or [0.0, 0.0, 1.0, 1.0]
+    sx = width * roi_width / max(1, int(metadata.get("image_width", width)))
+    sy = height * roi_height / max(1, int(metadata.get("image_height", height)))
+    for obj in metadata.get("objects", []):
+        x1, y1, x2, y2 = obj["bbox"]
+        start = (int(width * left + x1 * sx), int(height * top + y1 * sy))
+        end = (int(width * left + x2 * sx), int(height * top + y2 * sy))
+        cv2.rectangle(output, start, end, (0, 220, 255), 2)
+        cv2.putText(output, f"{obj['class_name']} {obj['confidence']:.0%}",
+                    (start[0], max(18, start[1] - 6)), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.55, (0, 220, 255), 2, cv2.LINE_AA)
+    return output
 
 
 def processing_worker(
@@ -387,13 +406,7 @@ def processing_worker(
                 break
             frame = decode_frame(encoded)
             processed = processor(frame)
-            if kind == "ocr":
-                latest_put(output_queue, ("analysis", processed))
-            else:
-                latest_put(
-                    output_queue,
-                    ("frame", (encode_frame(processed), {})),
-                )
+            latest_put(output_queue, ("analysis", processed))
     except Exception as error:
         if not stop_event.is_set():
             latest_put(
@@ -981,7 +994,9 @@ def run_gui(args: argparse.Namespace) -> int:
         ) -> None:
             super().__init__()
             self._camera_name = camera_name
-            self._automatic_detection = camera_name == "camera-1"
+            self._automatic_detection = True
+            self._is_ocr = camera_name == "camera-1"
+            self._object_references: list[dict[str, Any]] = []
             self._text_references: list[str] = []
             self._pending_reference_frame = None
             self._active_reference_capture = False
@@ -994,7 +1009,7 @@ def run_gui(args: argparse.Namespace) -> int:
             self._removal_started: float | None = None
             self._required_removal_readings = 5
             self._removal_hold_seconds = 1.5
-            inspection_config = load_project_config().get("camera_1_inspection", {})
+            inspection_config = load_project_config().get(f"{camera_name.replace('-', '_')}_inspection", {})
             if not isinstance(inspection_config, dict):
                 inspection_config = {}
             def number_setting(name: str, default: float, low: float, high: float) -> float:
@@ -1005,7 +1020,16 @@ def run_gui(args: argparse.Namespace) -> int:
                     return default
             self._placement_wait_seconds = number_setting("placement_wait_seconds", 2.0, 0.0, 60.0)
             self._automatic_match_threshold = number_setting("match_score_threshold", 0.85, 0.0, 1.0)
-            self._ocr_confidence_threshold = number_setting("ocr_confidence_threshold", 0.85, 0.0, 1.0)
+            self._ocr_confidence_threshold = number_setting(
+                "ocr_confidence_threshold" if self._is_ocr else "object_confidence_threshold",
+                0.85 if self._is_ocr else 0.60, 0.0, 1.0)
+            self._placement_confirm_readings = int(number_setting("placement_confirm_readings", 3, 2, 30))
+            self._placement_confirm_seconds = number_setting("placement_confirm_seconds", 0.6, 0.1, 10.0)
+            self._placement_min_text_length = int(number_setting("placement_min_text_length", 2, 1, 100))
+            self._presence_text = ""
+            self._presence_readings = 0
+            self._presence_started = None
+            self._placement_missing_readings = 0
             self._placement_started: float | None = None
             self._window_best_score = 0.0
             self._window_best_metadata: dict[str, Any] = {}
@@ -1152,6 +1176,7 @@ def run_gui(args: argparse.Namespace) -> int:
             self._snapshot_dir = repository_root / self._camera_name
             self._snapshot_dir.mkdir(parents=True, exist_ok=True)
             self._model_feature = None
+            self._object_references = []
             self.prepare_for_camera()
             self._load_model()
 
@@ -1190,8 +1215,12 @@ def run_gui(args: argparse.Namespace) -> int:
             self.prepare_for_camera()
 
         def prepare_for_camera(self) -> None:
-            """Reset inspection state and require manual background capture."""
+            """Reset the automatic inspection when the camera or ROI changes."""
             self._placement_started = None
+            self._presence_text = ""
+            self._presence_readings = 0
+            self._presence_started = None
+            self._placement_missing_readings = 0
             self._window_best_score = 0.0
             self._window_best_metadata = {}
             self._window_has_confident_text = False
@@ -1214,7 +1243,7 @@ def run_gui(args: argparse.Namespace) -> int:
             self._inspection_overlay.hide()
             if self._automatic_detection:
                 self.match_badge.setText("AUTOMATIC DETECTION")
-                self.show_message("Reading text automatically")
+                self.show_message("Reading text automatically" if self._is_ocr else "Detecting objects automatically")
                 self.inspection_reset.emit(self._camera_name)
                 return
             self.match_badge.setText("SET EMPTY BACKGROUND")
@@ -1328,9 +1357,20 @@ def run_gui(args: argparse.Namespace) -> int:
             return self._snapshot_dir / "visual_match_model.npz"
 
         def _load_model(self) -> None:
+            if not self._is_ocr:
+                try:
+                    data = json.loads(self._reference_path.read_text(encoding="utf-8"))
+                    self._object_references = [r for r in data["objects"]
+                        if isinstance(r, dict) and isinstance(r.get("class_name"), str)
+                        and len(r.get("feature", [])) == 768
+                        and np.isfinite(np.asarray(r["feature"], dtype=np.float32)).all()]
+                except (OSError, ValueError, KeyError, TypeError):
+                    self._object_references = []
+                self.match_badge.setText("WATCHING")
+                return
             if self._automatic_detection:
                 try:
-                    data = json.loads(self._text_reference_path.read_text(encoding="utf-8"))
+                    data = json.loads(self._reference_path.read_text(encoding="utf-8"))
                     self._text_references = [str(t) for t in data["texts"] if isinstance(t, str) and t.strip()]
                 except (OSError, ValueError, KeyError, TypeError):
                     self._text_references = []
@@ -1352,8 +1392,8 @@ def run_gui(args: argparse.Namespace) -> int:
                 )
 
         @property
-        def _text_reference_path(self) -> Path:
-            return self._snapshot_dir / "text_references.json"
+        def _reference_path(self) -> Path:
+            return self._snapshot_dir / ("text_references.json" if self._is_ocr else "object_references.json")
 
         @staticmethod
         def _normalize_text(text: str) -> str:
@@ -1362,7 +1402,7 @@ def run_gui(args: argparse.Namespace) -> int:
         def _save_text_reference(self, text: str, confidence: float) -> None:
             self._active_reference_capture = False
             self.save_button.setEnabled(True)
-            if not self._normalize_text(text) or confidence < 0.85:
+            if not self._normalize_text(text) or confidence < self._ocr_confidence_threshold:
                 self.show_message("Reference not saved: text unclear. Adjust ROI/lighting and click Save again", error=True)
                 return
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
@@ -1372,9 +1412,9 @@ def run_gui(args: argparse.Namespace) -> int:
                 references.append(text)
             try:
                 snapshot_path.write_bytes(encode_frame(self._ocr_frame))
-                temporary = self._text_reference_path.with_suffix(".tmp")
+                temporary = self._reference_path.with_suffix(".tmp")
                 temporary.write_text(json.dumps({"texts": references}, ensure_ascii=False, indent=2), encoding="utf-8")
-                temporary.replace(self._text_reference_path)
+                temporary.replace(self._reference_path)
             except OSError as error:
                 self.show_message(f"Reference save failed: {error}", error=True)
                 return
@@ -1382,6 +1422,10 @@ def run_gui(args: argparse.Namespace) -> int:
             self._confident_match_readings = 0
             self._candidate_reference = ""
             self._placement_started = None
+            self._presence_text = ""
+            self._presence_readings = 0
+            self._presence_started = None
+            self._placement_missing_readings = 0
             self._window_best_score = 0.0
             self._window_best_metadata = {}
             self._window_has_confident_text = False
@@ -1390,6 +1434,29 @@ def run_gui(args: argparse.Namespace) -> int:
             self.inspection_reset.emit(self._camera_name)
             self.match_badge.setText("WATCHING")
             self.show_message(f"Saved reference text: {text}")
+
+        def _save_object_reference(self, objects: list[dict[str, Any]]) -> None:
+            self._active_reference_capture = False
+            self.save_button.setEnabled(True)
+            if len(objects) != 1:
+                self.show_message("Reference not saved: place one detectable object in the ROI and click Save", error=True)
+                return
+            reference = objects[0]
+            references = self._object_references + [{
+                "class_name": reference["class_name"], "feature": reference["feature"],
+            }]
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+            try:
+                (self._snapshot_dir / f"{self._camera_name}_{timestamp}.jpg").write_bytes(encode_frame(self._ocr_frame))
+                temporary = self._reference_path.with_suffix(".tmp")
+                temporary.write_text(json.dumps({"objects": references}, indent=2), encoding="utf-8")
+                temporary.replace(self._reference_path)
+            except OSError as error:
+                self.show_message(f"Reference save failed: {error}", error=True)
+                return
+            self._object_references = references
+            self.prepare_for_camera()
+            self.show_message(f"Saved object reference: {reference['class_name']}")
 
         def show_message(self, text: str, *, error: bool = False) -> None:
             self.status.setText(text)
@@ -1412,11 +1479,22 @@ def run_gui(args: argparse.Namespace) -> int:
             ocr = metadata.get("ocr", {})
             text = str(ocr.get("text", "")).strip() if isinstance(ocr, dict) else ""
             if self._automatic_detection:
-                words = ocr.get("words", []) if isinstance(ocr, dict) else []
-                confidence = min((float(w.get("confidence", 0)) for w in words if str(w.get("text", "")).strip()), default=0.0)
+                if self._is_ocr:
+                    words = ocr.get("words", []) if isinstance(ocr, dict) else []
+                    confidence = min((float(w.get("confidence", 0)) for w in words if str(w.get("text", "")).strip()), default=0.0)
+                    has_references = bool(self._text_references)
+                else:
+                    objects = [obj for obj in metadata.get("objects", [])
+                               if float(obj.get("confidence", 0)) >= self._ocr_confidence_threshold]
+                    text = "|".join(sorted(str(obj["class_name"]) for obj in objects))
+                    confidence = min((float(obj["confidence"]) for obj in objects), default=0.0)
+                    has_references = bool(self._object_references)
                 if self._active_reference_capture:
                     self._ocr_capture_submitted = False
-                    self._save_text_reference(text, confidence)
+                    if self._is_ocr:
+                        self._save_text_reference(text, confidence)
+                    else:
+                        self._save_object_reference(objects)
                     return
                 if self._last_result is not None:
                     # Keep the accepted result through weak or different OCR readings.
@@ -1435,6 +1513,10 @@ def run_gui(args: argparse.Namespace) -> int:
                             and now - self._removal_started >= self._removal_hold_seconds
                         ):
                             self._placement_started = None
+                            self._presence_text = ""
+                            self._presence_readings = 0
+                            self._presence_started = None
+                            self._placement_missing_readings = 0
                             self._window_best_score = 0.0
                             self._window_best_metadata = {}
                             self._window_has_confident_text = False
@@ -1454,8 +1536,15 @@ def run_gui(args: argparse.Namespace) -> int:
                     self.show_message("Matched. Remove the object before the next inspection" if self._last_result else "Not matched. Remove the object before the next inspection")
                     return
                 normalized = self._normalize_text(text)
-                scores = [(SequenceMatcher(None, normalized, self._normalize_text(ref)).ratio(), ref)
-                          for ref in self._text_references] if normalized else []
+                if self._is_ocr:
+                    scores = [(SequenceMatcher(None, normalized, self._normalize_text(ref)).ratio(), ref)
+                              for ref in self._text_references] if normalized else []
+                else:
+                    # One inspection object per ROI. Extra objects cannot produce a pass.
+                    scores = [(visual_similarity(np.asarray(objects[0]["feature"], dtype=np.float32),
+                                                 np.asarray(ref["feature"], dtype=np.float32)), ref["class_name"])
+                              for ref in self._object_references
+                              if len(objects) == 1 and objects[0]["class_name"] == ref["class_name"]]
                 score, reference = max(scores, default=(0.0, ""))
                 self._captured_similarity = score
                 if reference != self._candidate_reference:
@@ -1474,14 +1563,50 @@ def run_gui(args: argparse.Namespace) -> int:
             if self._automatic_detection:
                 now = time.monotonic()
                 if self._placement_started is None:
-                    if not normalized:
+                    reliable = (
+                        len(normalized) >= self._placement_min_text_length
+                        and confidence >= self._ocr_confidence_threshold
+                    )
+                    if not reliable:
+                        self._presence_text = ""
+                        self._presence_readings = 0
+                        self._presence_started = None
+                    elif (
+                        self._presence_started is None
+                        or SequenceMatcher(None, normalized, self._presence_text).ratio() < 0.8
+                    ):
+                        self._presence_text = normalized
+                        self._presence_readings = 1
+                        self._presence_started = now
+                    else:
+                        self._presence_readings += 1
+                    if (
+                        self._presence_readings < self._placement_confirm_readings
+                        or self._presence_started is None
+                        or now - self._presence_started < self._placement_confirm_seconds
+                    ):
                         self.match_badge.setText("WATCHING")
-                        self.show_message("Place text in the ROI to start inspection")
+                        self.show_message("Waiting for stable text in the ROI" if self._is_ocr else "Waiting for a stable object in the ROI")
                         return
                     self._placement_started = now
                     self._window_best_score = 0.0
                     self._window_best_metadata = metadata
                     self._window_has_confident_text = False
+                # Do not issue a failure for a candidate that vanished during observation.
+                if len(normalized) < self._placement_min_text_length or confidence < self._ocr_confidence_threshold:
+                    self._placement_missing_readings += 1
+                    if self._placement_missing_readings >= 3:
+                        self._placement_started = None
+                        self._presence_text = ""
+                        self._presence_readings = 0
+                        self._presence_started = None
+                        self._window_best_score = 0.0
+                        self._window_has_confident_text = False
+                        self.match_badge.setText("WATCHING")
+                        self.show_message("Waiting for stable text in the ROI" if self._is_ocr else "Waiting for a stable object in the ROI")
+                    # Never decide from an empty or unreliable current reading.
+                    return
+                self._placement_missing_readings = 0
                 if normalized and confidence >= self._ocr_confidence_threshold:
                     if not self._window_has_confident_text or score > self._window_best_score:
                         self._window_best_score = score
@@ -1498,7 +1623,7 @@ def run_gui(args: argparse.Namespace) -> int:
                     return
                 matched = (
                     self._window_has_confident_text
-                    and bool(self._text_references)
+                    and has_references
                     and self._window_best_score >= self._automatic_match_threshold
                 )
                 self._captured_similarity = self._window_best_score
@@ -1522,7 +1647,7 @@ def run_gui(args: argparse.Namespace) -> int:
                 self._camera_name,
                 matched,
                 self._captured_similarity,
-                str(self._text_reference_path if self._automatic_detection else self._model_path),
+                str(self._reference_path if self._automatic_detection else self._model_path),
                 metadata,
             )
             if not self._automatic_detection:
@@ -1655,7 +1780,7 @@ def run_gui(args: argparse.Namespace) -> int:
                     return
                 self._pending_reference_frame = crop_to_roi(self._latest_inspection_frame, self.roi).copy()
                 self.save_button.setEnabled(False)
-                self.show_message("Reading captured reference text...")
+                self.show_message("Reading captured reference text..." if self._is_ocr else "Reading captured object reference...")
                 return
             if self._latest_jpeg is None:
                 self.show_message("No frame available to save", error=True)
@@ -1886,8 +2011,7 @@ def run_gui(args: argparse.Namespace) -> int:
                     self._camera_rois.get(camera_name),
                 )
                 panel.inspection_completed.connect(self._record_camera_inspection)
-                if column == 0:
-                    panel.inspection_completed.connect(self._show_inspection_overlay)
+                panel.inspection_completed.connect(self._show_inspection_overlay)
                 panel.inspection_reset.connect(self._clear_analysis_metadata)
                 panel.inspection_reset.connect(self._audio_alert_manager.reset_classification)
                 panel.classification_changed.connect(
@@ -1979,7 +2103,7 @@ def run_gui(args: argparse.Namespace) -> int:
             model_path: str,
             metadata: object,
         ) -> None:
-            """Save the completed OCR inspection result."""
+            """Save one completed OCR or object inspection result."""
             ocr_data: dict[str, Any] = {}
             if isinstance(metadata, dict):
                 candidate = metadata.get("ocr", {})
@@ -1997,6 +2121,12 @@ def run_gui(args: argparse.Namespace) -> int:
             }
             if captured_text:
                 captured_data["ocr_text"] = captured_text
+            if isinstance(metadata, dict) and "objects" in metadata:
+                captured_data["objects"] = [
+                    {key: value for key, value in obj.items() if key != "feature"}
+                    for obj in metadata["objects"]
+                ]
+            inspection_kind = "place_text_match" if camera_name == "camera-1" else "object_match"
             send_result = (
                 self._inspection_sender.send_pass
                 if matched
@@ -2005,14 +2135,14 @@ def run_gui(args: argparse.Namespace) -> int:
             result = send_result(
                 camera_id=camera_name,
                 section_id=camera_name.upper(),
-                event_type="place_text_match",
+                event_type=inspection_kind,
                 captured_data=captured_data,
                 confidence=round(similarity, 4),
                 evidence_link=model_path,
                 comments=(
-                    f"{camera_name} place text matched"
+                    f"{camera_name} {inspection_kind} matched"
                     if matched
-                    else f"{camera_name} place text did not match"
+                    else f"{camera_name} {inspection_kind} did not match"
                 ),
                 remarks="Automatically generated by Gibraltar Visual AI",
             )
@@ -2167,28 +2297,13 @@ def run_gui(args: argparse.Namespace) -> int:
                             fy=scale,
                             interpolation=cv2.INTER_AREA,
                         )
-                    analysis_frame = frame
-                    if camera_index == 0:
-                        display_frame = draw_ocr_overlay(
-                            frame,
-                            self._latest_analysis_metadata[0],
-                            panel.roi,
-                        )
-                        panel.show_jpeg(
-                            encode_frame(display_frame),
-                            self._latest_analysis_metadata[0],
-                            inspection_frame=frame,
-                        )
-                    if camera_index == 0:
-                        analysis_frame = panel._ocr_frame
-                    if camera_index == 0 and (
-                        panel.ocr_capture_submitted
-                        or not panel._awaiting_ocr
-                    ):
+                    draw_overlay = draw_ocr_overlay if camera_index == 0 else draw_object_overlay
+                    display_frame = draw_overlay(frame, self._latest_analysis_metadata[camera_index], panel.roi)
+                    panel.show_jpeg(encode_frame(display_frame), self._latest_analysis_metadata[camera_index], inspection_frame=frame)
+                    if panel.ocr_capture_submitted or not panel._awaiting_ocr:
                         continue
-                    encoded = encode_frame(analysis_frame)
-                    if camera_index == 0:
-                        panel.mark_ocr_capture_submitted()
+                    encoded = encode_frame(panel._ocr_frame)
+                    panel.mark_ocr_capture_submitted()
                     latest_put(input_queue, encoded)
 
             for panel_index, (panel, output_queue, worker) in enumerate(zip(
@@ -2210,8 +2325,7 @@ def run_gui(args: argparse.Namespace) -> int:
                     elif message_type == "analysis":
                         if isinstance(payload, dict):
                             self._latest_analysis_metadata[panel_index] = payload
-                            if panel_index == 0:
-                                panel.accept_analysis(payload)
+                            panel.accept_analysis(payload)
                     else:
                         panel.show_message(
                             payload,
