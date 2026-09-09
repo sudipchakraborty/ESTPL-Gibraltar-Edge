@@ -4,6 +4,8 @@ setlocal
 set "APP_ROOT=%~dp0"
 set "PADDLE_PDX_CACHE_HOME=%APP_ROOT%runtime\paddlex"
 set "YOLO_CONFIG_DIR=%APP_ROOT%runtime\ultralytics"
+set "NVIDIA_SITE_PACKAGES=%APP_ROOT%.venv\Lib\site-packages\nvidia"
+set "PATH=%NVIDIA_SITE_PACKAGES%\cu13\bin\x86_64;%NVIDIA_SITE_PACKAGES%\cu13\bin;%NVIDIA_SITE_PACKAGES%\cublas\bin;%NVIDIA_SITE_PACKAGES%\cuda_runtime\bin;%NVIDIA_SITE_PACKAGES%\cudnn\bin;%NVIDIA_SITE_PACKAGES%\cufft\bin;%NVIDIA_SITE_PACKAGES%\curand\bin;%NVIDIA_SITE_PACKAGES%\cusolver\bin;%NVIDIA_SITE_PACKAGES%\cusparse\bin;%NVIDIA_SITE_PACKAGES%\nvjitlink\bin;%PATH%"
 
 if not exist "%APP_ROOT%runtime" mkdir "%APP_ROOT%runtime"
 if not exist "%PADDLE_PDX_CACHE_HOME%" mkdir "%PADDLE_PDX_CACHE_HOME%"

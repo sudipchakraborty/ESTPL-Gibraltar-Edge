@@ -13,6 +13,7 @@ from unittest.mock import Mock, patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import numpy as np
+import cv2
 from PySide6.QtWidgets import QApplication
 from Projects import main as app_module
 
@@ -79,8 +80,8 @@ class InspectionFlowTests(unittest.TestCase):
         self.assertFalse(p.events)
         p._load_model()
 
-    def test_all_cameras_save_match_latch_remove_mismatch(self):
-        for index in (1, 2, 3):
+    def test_camera_1_save_match_latch_remove_mismatch(self):
+        for index in (1,):
             with self.subTest(camera=index):
                 p = self.panel(index)
                 self.save(p, index)
@@ -106,7 +107,7 @@ class InspectionFlowTests(unittest.TestCase):
                 self.assertEqual(p._inspection_overlay.text(), "✕")
 
     def test_glitches_and_vanished_candidates_do_not_fail(self):
-        for index in (1, 2, 3):
+        for index in (1,):
             p = self.panel(index)
             for _ in range(10):
                 self.read(p, self.metadata(index))
@@ -121,39 +122,37 @@ class InspectionFlowTests(unittest.TestCase):
             self.assertIsNone(p._placement_started)
             self.assertFalse(p.events)
 
-    def test_object_reference_rejects_empty_or_multiple_objects(self):
-        p = self.panel(2)
-        for count in (0, 2):
-            p._latest_inspection_frame = self.frame.copy()
-            p.save_snapshot()
-            p.request_detection()
-            metadata = self.metadata(2)
-            metadata["objects"] *= count
-            self.read(p, metadata)
-            self.assertFalse(p._reference_path.exists())
-            self.assertTrue(p.save_button.isEnabled())
-
-    def test_roi_capture_and_independent_references(self):
+    def test_object_cameras_save_and_train_in_separate_folders(self):
         first, second = self.panel(2), self.panel(3)
-        first.set_roi([.25, .25, .5, .5])
-        first._latest_inspection_frame = self.frame.copy()
-        first.save_snapshot()
-        first.request_detection()
-        self.assertEqual(first._ocr_frame.shape[:2], (40, 50))
-        self.read(first, self.metadata(2))
-        second._load_model()
-        self.assertEqual(len(first._object_references), 1)
-        self.assertEqual(second._object_references, [])
+        encoded, jpeg = cv2.imencode(".jpg", self.frame)
+        self.assertTrue(encoded)
+        for panel in (first, second):
+            self.assertFalse(panel.save_button.isHidden())
+            self.assertFalse(panel.train_button.isHidden())
+            self.assertFalse(panel.detect_button.isHidden())
+            self.assertFalse(panel.set_background_button.isHidden())
+            panel._latest_jpeg = jpeg.tobytes()
+            panel.save_snapshot()
 
-    def test_same_class_different_appearance_fails(self):
+        first_images = list((Path(self.folder.name) / "camera-2").glob("*.jpg"))
+        second_images = list((Path(self.folder.name) / "camera-3").glob("*.jpg"))
+        self.assertEqual(len(first_images), 1)
+        self.assertEqual(len(second_images), 1)
+        self.assertNotEqual(first_images[0].parent, second_images[0].parent)
+
+        first._train_model_worker(first_images)
+        first._load_model()
+        self.assertTrue(first._model_path.is_file())
+        self.assertIsNotNone(first._model_feature)
+        self.assertFalse(second._model_path.exists())
+
+    def test_object_camera_uses_visual_model_without_ocr_text(self):
         p = self.panel(2)
-        self.save(p, 2)
-        metadata = self.metadata(2)
-        different = np.full_like(self.frame, (200, 0, 0))
-        metadata["objects"][0]["feature"] = app_module.extract_visual_feature(different).tolist()
-        for _ in range(7):
-            self.read(p, metadata)
-        self.assertFalse(p.events[-1][1])
+        p._model_feature = app_module.extract_visual_feature(self.frame)
+        p._captured_similarity = 1.0
+        p._awaiting_ocr = True
+        p.accept_analysis(self.metadata(2))
+        self.assertTrue(p.events[-1][1])
 
     def test_object_transaction_contains_detection_details(self):
         tree = ast.parse(Path(app_module.__file__).read_text(encoding="utf-8"))

@@ -994,8 +994,10 @@ def run_gui(args: argparse.Namespace) -> int:
         ) -> None:
             super().__init__()
             self._camera_name = camera_name
-            self._automatic_detection = True
             self._is_ocr = camera_name == "camera-1"
+            # Camera 1 keeps the automatic OCR/reference workflow. The two
+            # object cameras use the operator-driven snapshot/training flow.
+            self._automatic_detection = self._is_ocr
             self._object_references: list[dict[str, Any]] = []
             self._text_references: list[str] = []
             self._pending_reference_frame = None
@@ -1347,7 +1349,11 @@ def run_gui(args: argparse.Namespace) -> int:
             self._awaiting_ocr = True
             self._ocr_capture_submitted = False
             self.detect_button.setEnabled(False)
-            self.show_message("Detecting and reading place text...")
+            self.show_message(
+                "Detecting and reading place text..."
+                if self._is_ocr
+                else "Checking the object against the trained model..."
+            )
 
         def save_roi_requested(self) -> None:
             self.window().save_rois()
@@ -1357,7 +1363,7 @@ def run_gui(args: argparse.Namespace) -> int:
             return self._snapshot_dir / "visual_match_model.npz"
 
         def _load_model(self) -> None:
-            if not self._is_ocr:
+            if not self._is_ocr and self._automatic_detection:
                 try:
                     data = json.loads(self._reference_path.read_text(encoding="utf-8"))
                     self._object_references = [r for r in data["objects"]
@@ -1553,8 +1559,7 @@ def run_gui(args: argparse.Namespace) -> int:
                 matched = bool(reference) and confidence >= self._ocr_confidence_threshold and score >= self._automatic_match_threshold
             else:
                 matched = (
-                bool(text)
-                and self._model_feature is not None
+                self._model_feature is not None
                 and self._captured_similarity >= self._match_threshold
             )
             self._inspection_locked = not self._automatic_detection
