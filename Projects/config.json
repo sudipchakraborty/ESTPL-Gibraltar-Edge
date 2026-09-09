@@ -1,5 +1,5 @@
 {
-    "image_repository_path": "C:\\Users\\Administrator\\Documents\\ESTPL-Gibraltar-Edge\\runtime\\Saved_Image_Gibraltar",
+    "image_repository_path": "runtime\\Saved_Image_Gibraltar",
     "database": {
         "name": "gibraltar",
         "table": "inspection_records",
@@ -10,8 +10,8 @@
     },
     "camera_sources": [
         {
-            "type": "rtsp",
-            "value": "rtsp://192.168.0.10:8554/gibpi2"
+            "type": "usb",
+            "value": "0"
         },
         {
             "type": "rtsp",
@@ -21,5 +21,68 @@
             "type": "rtsp",
             "value": "rtsp://192.168.0.8:8554/gibpi3"
         }
-    ]
+    ],
+    "audio_alerts": {
+        "camera-1": {
+            "enabled": true,
+            "matched": {
+                "enabled": true,
+                "kind": "tone",
+                "use_default": true,
+                "path": ""
+            },
+            "mismatch": {
+                "enabled": true,
+                "kind": "tone",
+                "use_default": true,
+                "path": ""
+            }
+        },
+        "camera-2": {
+            "enabled": false,
+            "matched": {
+                "enabled": true,
+                "kind": "tone",
+                "use_default": true,
+                "path": ""
+            },
+            "mismatch": {
+                "enabled": false,
+                "kind": "tone",
+                "use_default": true,
+                "path": ""
+            }
+        },
+        "camera-3": {
+            "enabled": false,
+            "matched": {
+                "enabled": true,
+                "kind": "tone",
+                "use_default": true,
+                "path": ""
+            },
+            "mismatch": {
+                "enabled": false,
+                "kind": "tone",
+                "use_default": true,
+                "path": ""
+            }
+        },
+        "system_volume": 100
+    },
+    "camera_rois": {
+        "camera-1": [
+            0.12459016393442623,
+            0.29431072210065645,
+            0.7508196721311475,
+            0.4135667396061269
+        ],
+        "camera-2": null,
+        "camera-3": null
+    },
+    "camera_1_inspection": {
+        "placement_wait_seconds": 2.0,
+        "match_score_threshold": 0.85,
+        "ocr_confidence_threshold": 0.85
+    }
 }
