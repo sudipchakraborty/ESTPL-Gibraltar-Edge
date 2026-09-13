@@ -29,6 +29,7 @@ import numpy as np
 PROJECT_DIR = Path(__file__).resolve().parent
 REPOSITORY_DIR = PROJECT_DIR.parent
 CONFIG_PATH = PROJECT_DIR / "config.json"
+MAX_CAMERAS = 6
 if str(REPOSITORY_DIR) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_DIR))
 
@@ -74,12 +75,12 @@ def save_image_repository_path(repository_path: Path) -> None:
 
 
 def load_camera_sources() -> list[dict[str, str]]:
-    """Load three camera sources, including legacy ``camera_urls`` values."""
+    """Load camera sources, including legacy ``camera_urls`` values."""
     config = load_project_config()
     configured = config.get("camera_sources")
     sources: list[dict[str, str]] = []
     if isinstance(configured, list):
-        for item in configured[:3]:
+        for item in configured[:MAX_CAMERAS]:
             if not isinstance(item, dict):
                 sources.append({"type": "rtsp", "value": ""})
                 continue
@@ -94,19 +95,57 @@ def load_camera_sources() -> list[dict[str, str]]:
         if isinstance(legacy_urls, list):
             sources = [
                 {"type": "rtsp", "value": str(value).strip()}
-                for value in legacy_urls[:3]
+                for value in legacy_urls[:MAX_CAMERAS]
             ]
     return sources + [
         {"type": "rtsp", "value": ""}
-        for _ in range(3 - len(sources))
+        for _ in range(MAX_CAMERAS - len(sources))
     ]
 
 
 def save_camera_sources(camera_sources: list[dict[str, str]]) -> None:
-    """Persist the three independent camera sources."""
+    """Persist independent camera sources."""
     config = load_project_config()
     config["camera_sources"] = camera_sources
     config.pop("camera_urls", None)
+    temporary_path = CONFIG_PATH.with_suffix(".json.tmp")
+    with temporary_path.open("w", encoding="utf-8") as config_file:
+        json.dump(config, config_file, indent=4)
+        config_file.write("\n")
+    temporary_path.replace(CONFIG_PATH)
+
+
+def default_camera_modes() -> dict[str, dict[str, bool]]:
+    return {
+        f"camera-{index}": {
+            "ocr": index == 1,
+            "image": index in {2, 3},
+        }
+        for index in range(1, MAX_CAMERAS + 1)
+    }
+
+
+def load_camera_modes() -> dict[str, dict[str, bool]]:
+    config = load_project_config()
+    configured = config.get("camera_modes", {})
+    modes = default_camera_modes()
+    if not isinstance(configured, dict):
+        return modes
+    for index in range(1, MAX_CAMERAS + 1):
+        camera_name = f"camera-{index}"
+        value = configured.get(camera_name)
+        if not isinstance(value, dict):
+            continue
+        modes[camera_name] = {
+            "ocr": bool(value.get("ocr", modes[camera_name]["ocr"])),
+            "image": bool(value.get("image", modes[camera_name]["image"])),
+        }
+    return modes
+
+
+def save_camera_modes(camera_modes: dict[str, dict[str, bool]]) -> None:
+    config = load_project_config()
+    config["camera_modes"] = camera_modes
     temporary_path = CONFIG_PATH.with_suffix(".json.tmp")
     with temporary_path.open("w", encoding="utf-8") as config_file:
         json.dump(config, config_file, indent=4)
@@ -118,7 +157,7 @@ def load_camera_rois() -> dict[str, list[float] | None]:
     config = load_project_config()
     configured = config.get("camera_rois", {})
     rois: dict[str, list[float] | None] = {}
-    for index in range(1, 4):
+    for index in range(1, MAX_CAMERAS + 1):
         value = configured.get(f"camera-{index}") if isinstance(configured, dict) else None
         if isinstance(value, list) and len(value) == 4:
             try:
@@ -454,6 +493,7 @@ def run_gui(args: argparse.Namespace) -> int:
         QLabel,
         QLineEdit,
         QComboBox,
+        QCheckBox,
         QMainWindow,
         QMessageBox,
         QPushButton,
@@ -981,6 +1021,56 @@ def run_gui(args: argparse.Namespace) -> int:
                 return
             self.accept()
 
+    class CameraModeDialog(QDialog):
+        def __init__(
+            self,
+            camera_modes: dict[str, dict[str, bool]],
+            parent: QWidget | None = None,
+        ) -> None:
+            super().__init__(parent)
+            self.setWindowTitle("Camera Mode Config")
+            self._rows: list[tuple[QCheckBox, QCheckBox]] = []
+            layout = QVBoxLayout(self)
+            note = QLabel(
+                "Select OCR detection, image processing, or both for each camera."
+            )
+            note.setWordWrap(True)
+            layout.addWidget(note)
+            form = QFormLayout()
+            for index in range(1, MAX_CAMERAS + 1):
+                camera_name = f"camera-{index}"
+                values = camera_modes.get(camera_name, {})
+                ocr_box = QCheckBox("OCR")
+                image_box = QCheckBox("Image")
+                ocr_box.setChecked(bool(values.get("ocr", False)))
+                image_box.setChecked(bool(values.get("image", False)))
+                row = QWidget()
+                row_layout = QHBoxLayout(row)
+                row_layout.setContentsMargins(0, 0, 0, 0)
+                row_layout.addWidget(ocr_box)
+                row_layout.addWidget(image_box)
+                row_layout.addStretch(1)
+                form.addRow(f"Camera {index}:", row)
+                self._rows.append((ocr_box, image_box))
+            layout.addLayout(form)
+            buttons = QDialogButtonBox(
+                QDialogButtonBox.StandardButton.Ok
+                | QDialogButtonBox.StandardButton.Cancel
+            )
+            buttons.accepted.connect(self.accept)
+            buttons.rejected.connect(self.reject)
+            layout.addWidget(buttons)
+
+        @property
+        def camera_modes(self) -> dict[str, dict[str, bool]]:
+            return {
+                f"camera-{index}": {
+                    "ocr": ocr_box.isChecked(),
+                    "image": image_box.isChecked(),
+                }
+                for index, (ocr_box, image_box) in enumerate(self._rows, start=1)
+            }
+
     class CameraPanel(QFrame):
         inspection_completed = Signal(str, bool, float, str, object)
         classification_changed = Signal(str, bool)
@@ -993,12 +1083,13 @@ def run_gui(args: argparse.Namespace) -> int:
             repository_root: Path,
             match_event_cooldown: float,
             roi: list[float] | None,
+            ocr_enabled: bool,
+            image_enabled: bool,
         ) -> None:
             super().__init__()
             self._camera_name = camera_name
-            self._is_ocr = camera_name == "camera-1"
-            # Camera 1 keeps the automatic OCR/reference workflow. The two
-            # object cameras use the operator-driven snapshot/training flow.
+            self._is_ocr = ocr_enabled
+            self._image_enabled = image_enabled
             self._automatic_detection = self._is_ocr
             self._object_references: list[dict[str, Any]] = []
             self._text_references: list[str] = []
@@ -1931,7 +2022,7 @@ def run_gui(args: argparse.Namespace) -> int:
             )
             webrtc_config = project_config.get("webrtc", {})
             self._webrtc_service = MultiCameraWebRTCService(
-                ["camera-1", "camera-2", "camera-3"],
+                [f"camera-{index}" for index in range(1, MAX_CAMERAS + 1)],
                 port=int(webrtc_config.get("port", 8000)),
                 fps=float(webrtc_config.get("fps", 10)),
                 target_width=int(webrtc_config.get("target_width", 960)),
@@ -1945,8 +2036,11 @@ def run_gui(args: argparse.Namespace) -> int:
             self._database_connect_thread.start()
             self._send_startup_test_transactions()
             self._camera_sources = load_camera_sources()
+            self._camera_modes = load_camera_modes()
             self._camera_rois = load_camera_rois()
-            self._cameras: list[RTSPCamera | LocalCamera | None] = [None, None, None]
+            self._cameras: list[RTSPCamera | LocalCamera | None] = [
+                None for _ in range(MAX_CAMERAS)
+            ]
 
             root = QWidget()
             root.setStyleSheet("background: #0f1217;")
@@ -1980,6 +2074,13 @@ def run_gui(args: argparse.Namespace) -> int:
             camera_settings_button.clicked.connect(
                 self._open_camera_settings
             )
+            camera_mode_button = QPushButton("Camera Mode Config")
+            camera_mode_button.setStyleSheet(
+                select_repository_button.styleSheet()
+            )
+            camera_mode_button.clicked.connect(
+                self._open_camera_mode_config
+            )
             transactions_button = QPushButton("View Transactions")
             transactions_button.setStyleSheet(
                 select_repository_button.styleSheet()
@@ -1998,33 +2099,33 @@ def run_gui(args: argparse.Namespace) -> int:
             repository_layout.addWidget(self._repository_path_label, 1)
             repository_layout.addWidget(select_repository_button)
             repository_layout.addWidget(camera_settings_button)
+            repository_layout.addWidget(camera_mode_button)
             repository_layout.addWidget(transactions_button)
             repository_layout.addWidget(audio_alert_button)
             layout.addWidget(repository_bar, 0, 0, 1, 3)
 
-            specifications = (
-                ("Embossed Text Camera", "ocr", args.ocr_device),
-                ("Object Detection Camera 1", "object", args.object_device),
-                ("Object Detection Camera 2", "object", args.object_device),
-            )
             self._panels: list[CameraPanel] = []
-            self._input_queues: list[Any] = []
-            self._output_queues: list[Any] = []
-            self._workers: list[Any] = []
+            self._input_queues: list[dict[str, Any]] = []
+            self._output_queues: list[dict[str, Any]] = []
+            self._workers: list[dict[str, Any]] = []
             self._latest_analysis_metadata: list[dict[str, Any]] = [
-                {},
-                {},
-                {},
+                {} for _ in range(MAX_CAMERAS)
             ]
 
-            for column, (title, kind, device) in enumerate(specifications):
+            for column in range(MAX_CAMERAS):
                 camera_name = f"camera-{column + 1}"
+                mode = self._camera_modes.get(camera_name, {})
+                ocr_enabled = bool(mode.get("ocr", False))
+                image_enabled = bool(mode.get("image", False))
+                title = self._camera_title(column + 1, ocr_enabled, image_enabled)
                 panel = CameraPanel(
                     title,
                     camera_name,
                     self._repository_root,
                     self._match_event_cooldown,
                     self._camera_rois.get(camera_name),
+                    ocr_enabled,
+                    image_enabled,
                 )
                 panel.inspection_completed.connect(self._record_camera_inspection)
                 panel.inspection_completed.connect(self._show_inspection_overlay)
@@ -2033,32 +2134,56 @@ def run_gui(args: argparse.Namespace) -> int:
                 panel.classification_changed.connect(
                     self._audio_alert_manager.handle_classification
                 )
-                layout.addWidget(panel, 1, column)
+                layout.addWidget(panel, 1 + (column // 3), column % 3)
                 self._panels.append(panel)
-                input_queue = context.Queue(maxsize=1)
-                output_queue = context.Queue(maxsize=2)
-                worker = context.Process(
-                    target=processing_worker,
-                    args=(
-                        kind,
-                        input_queue,
-                        output_queue,
-                        self._stop_event,
-                        device,
-                    ),
-                    name=f"Gibraltar-{kind}-{column + 1}",
-                    daemon=True,
-                )
-                worker.start()
-                self._input_queues.append(input_queue)
-                self._output_queues.append(output_queue)
-                self._workers.append(worker)
+                input_queues: dict[str, Any] = {}
+                output_queues: dict[str, Any] = {}
+                workers: dict[str, Any] = {}
+                for kind, enabled, device in (
+                    ("ocr", ocr_enabled, args.ocr_device),
+                    ("object", image_enabled, args.object_device),
+                ):
+                    if not enabled:
+                        continue
+                    input_queue = context.Queue(maxsize=1)
+                    output_queue = context.Queue(maxsize=2)
+                    worker = context.Process(
+                        target=processing_worker,
+                        args=(
+                            kind,
+                            input_queue,
+                            output_queue,
+                            self._stop_event,
+                            device,
+                        ),
+                        name=f"Gibraltar-{kind}-{column + 1}",
+                        daemon=True,
+                    )
+                    worker.start()
+                    input_queues[kind] = input_queue
+                    output_queues[kind] = output_queue
+                    workers[kind] = worker
+                self._input_queues.append(input_queues)
+                self._output_queues.append(output_queues)
+                self._workers.append(workers)
 
             self._connect_cameras()
 
             self._timer = QTimer(self)
             self._timer.timeout.connect(self._update)
             self._timer.start(max(1, round(1000 / args.fps)))
+
+        @staticmethod
+        def _camera_title(index: int, ocr_enabled: bool, image_enabled: bool) -> str:
+            if ocr_enabled and image_enabled:
+                mode = "OCR + Image"
+            elif ocr_enabled:
+                mode = "OCR Detection"
+            elif image_enabled:
+                mode = "Image Processing"
+            else:
+                mode = "Disabled"
+            return f"Camera {index} - {mode}"
 
         def _show_inspection_overlay(
             self,
@@ -2142,14 +2267,18 @@ def run_gui(args: argparse.Namespace) -> int:
                     {key: value for key, value in obj.items() if key != "feature"}
                     for obj in metadata["objects"]
                 ]
-            inspection_kind = "place_text_match" if camera_name == "camera-1" else "object_match"
+            panel_index = int(camera_name.rsplit("-", 1)[-1]) - 1
+            panel = self._panels[panel_index]
+            inspection_kind = (
+                "place_text_match"
+                if panel._is_ocr
+                else "object_match"
+            )
             send_result = (
                 self._inspection_sender.send_pass
                 if matched
                 else self._inspection_sender.send_fail
             )
-            panel_index = int(camera_name.rsplit("-", 1)[-1]) - 1
-            panel = self._panels[panel_index]
             evidence_frame = panel._ocr_frame
             evidence_jpeg = (
                 encode_frame(evidence_frame)
@@ -2244,6 +2373,27 @@ def run_gui(args: argparse.Namespace) -> int:
             self._camera_sources = camera_sources
             self._connect_cameras()
 
+        def _open_camera_mode_config(self) -> None:
+            dialog = CameraModeDialog(self._camera_modes, self)
+            if dialog.exec() != QDialog.DialogCode.Accepted:
+                return
+            camera_modes = dialog.camera_modes
+            try:
+                save_camera_modes(camera_modes)
+            except OSError as error:
+                QMessageBox.critical(
+                    self,
+                    "Camera Mode Config",
+                    f"Could not save camera modes: {error}",
+                )
+                return
+            self._camera_modes = camera_modes
+            QMessageBox.information(
+                self,
+                "Camera Mode Config",
+                "Camera mode settings saved. Restart the Edge app to load the selected OCR/image pipelines.",
+            )
+
         def _open_transactions(self) -> None:
             dialog = TransactionDialog(self._server_url, self)
             dialog.exec()
@@ -2252,7 +2402,7 @@ def run_gui(args: argparse.Namespace) -> int:
             for camera in self._cameras:
                 if camera is not None:
                     camera.release()
-            self._cameras = [None, None, None]
+            self._cameras = [None for _ in range(MAX_CAMERAS)]
 
             for index, (camera_source, panel) in enumerate(
                 zip(self._camera_sources, self._panels)
@@ -2270,11 +2420,11 @@ def run_gui(args: argparse.Namespace) -> int:
                     continue
                 panel.video.setText(f"Connecting Camera {index + 1}...")
                 if camera_source["type"] == "usb":
-                    # Camera 1 runs OCR. This camera's YUY2 USB mode delivers
+                    # OCR cameras use a smaller USB frame for lower inference latency.
                     # ~7 FPS at 720p but near 30 FPS at 640x480, and the lower
                     # resolution also materially reduces OCR inference time.
-                    usb_width = 640 if index == 0 else args.width
-                    usb_height = 480 if index == 0 else args.height
+                    usb_width = 640 if panel._is_ocr else args.width
+                    usb_height = 480 if panel._is_ocr else args.height
                     camera = LocalCamera(
                         int(source_value),
                         width=usb_width,
@@ -2306,7 +2456,7 @@ def run_gui(args: argparse.Namespace) -> int:
                 self.close()
                 return
 
-            for camera_index, (camera, panel, input_queue) in enumerate(zip(
+            for camera_index, (camera, panel, input_queues) in enumerate(zip(
                 self._cameras,
                 self._panels,
                 self._input_queues,
@@ -2315,7 +2465,7 @@ def run_gui(args: argparse.Namespace) -> int:
                     continue
                 ok, frame = camera.read_latest()
                 if ok:
-                    if camera_index == 0 and max(frame.shape[:2]) > 960:
+                    if panel._is_ocr and max(frame.shape[:2]) > 960:
                         scale = 960.0 / max(frame.shape[:2])
                         frame = cv2.resize(
                             frame,
@@ -2324,46 +2474,69 @@ def run_gui(args: argparse.Namespace) -> int:
                             fy=scale,
                             interpolation=cv2.INTER_AREA,
                         )
-                    draw_overlay = draw_ocr_overlay if camera_index == 0 else draw_object_overlay
-                    display_frame = draw_overlay(frame, self._latest_analysis_metadata[camera_index], panel.roi)
+                    metadata = self._latest_analysis_metadata[camera_index]
+                    display_frame = frame
+                    if "objects" in metadata:
+                        display_frame = draw_object_overlay(
+                            display_frame,
+                            metadata,
+                            panel.roi,
+                        )
+                    if "ocr" in metadata:
+                        display_frame = draw_ocr_overlay(
+                            display_frame,
+                            metadata,
+                            panel.roi,
+                        )
                     self._webrtc_service.publish(panel._camera_name, display_frame)
                     panel.show_jpeg(encode_frame(display_frame), self._latest_analysis_metadata[camera_index], inspection_frame=frame)
-                    if panel.ocr_capture_submitted or not panel._awaiting_ocr:
-                        continue
-                    encoded = encode_frame(panel._ocr_frame)
-                    panel.mark_ocr_capture_submitted()
-                    latest_put(input_queue, encoded)
+                    object_queue = input_queues.get("object")
+                    if object_queue is not None:
+                        latest_put(object_queue, encode_frame(crop_to_roi(frame, panel.roi)))
+                    ocr_queue = input_queues.get("ocr")
+                    if (
+                        ocr_queue is not None
+                        and panel._awaiting_ocr
+                        and not panel.ocr_capture_submitted
+                    ):
+                        encoded = encode_frame(panel._ocr_frame)
+                        panel.mark_ocr_capture_submitted()
+                        latest_put(ocr_queue, encoded)
 
-            for panel_index, (panel, output_queue, worker) in enumerate(zip(
+            for panel_index, (panel, output_queues, workers) in enumerate(zip(
                 self._panels,
                 self._output_queues,
                 self._workers,
             )):
-                latest = None
-                while True:
-                    try:
-                        latest = output_queue.get_nowait()
-                    except queue.Empty:
-                        break
-                if latest is not None:
-                    message_type, payload = latest
-                    if message_type == "frame":
-                        frame_data, metadata = payload
-                        panel.show_jpeg(frame_data, metadata)
-                    elif message_type == "analysis":
-                        if isinstance(payload, dict):
-                            self._latest_analysis_metadata[panel_index] = payload
-                            panel.accept_analysis(payload)
-                    else:
+                for kind, output_queue in output_queues.items():
+                    latest = None
+                    while True:
+                        try:
+                            latest = output_queue.get_nowait()
+                        except queue.Empty:
+                            break
+                    if latest is not None:
+                        message_type, payload = latest
+                        if message_type == "frame":
+                            frame_data, metadata = payload
+                            panel.show_jpeg(frame_data, metadata)
+                        elif message_type == "analysis":
+                            if isinstance(payload, dict):
+                                self._latest_analysis_metadata[panel_index].update(payload)
+                                if kind == "ocr" or panel._awaiting_ocr:
+                                    panel.accept_analysis(payload)
+                        else:
+                            panel.show_message(
+                                payload,
+                                error=message_type == "error",
+                            )
+                for worker in workers.values():
+                    if not worker.is_alive() and worker.exitcode is not None:
                         panel.show_message(
-                            payload,
-                            error=message_type == "error",
+                            f"Worker stopped (exit code {worker.exitcode})",
+                            error=True,
                         )
-                elif not worker.is_alive() and worker.exitcode is not None:
-                    panel.show_message(
-                        f"Worker stopped (exit code {worker.exitcode})",
-                        error=True,
-                    )
+                        break
 
         def shutdown(self) -> None:
             if self._stopping:
@@ -2379,23 +2552,25 @@ def run_gui(args: argparse.Namespace) -> int:
 
             # Wake workers immediately instead of waiting for Queue.get()
             # timeouts. Old queued frames are discarded by latest_put.
-            for input_queue in self._input_queues:
-                latest_put(input_queue, None)
+            for input_queues in self._input_queues:
+                for input_queue in input_queues.values():
+                    latest_put(input_queue, None)
 
-            for worker in self._workers:
-                worker.join(timeout=8.0)
-                if worker.is_alive():
-                    print(
-                        f"Stopping unresponsive worker: {worker.name}",
-                        file=sys.stderr,
-                    )
-                    worker.terminate()
-                    worker.join(timeout=3.0)
+            for workers in self._workers:
+                for worker in workers.values():
+                    worker.join(timeout=8.0)
+                    if worker.is_alive():
+                        print(
+                            f"Stopping unresponsive worker: {worker.name}",
+                            file=sys.stderr,
+                        )
+                        worker.terminate()
+                        worker.join(timeout=3.0)
 
-            for pipeline_queue in (
-                *self._input_queues,
-                *self._output_queues,
-            ):
+            pipeline_queues = []
+            for queue_group in (*self._input_queues, *self._output_queues):
+                pipeline_queues.extend(queue_group.values())
+            for pipeline_queue in pipeline_queues:
                 # Do not wait on multiprocessing feeder threads during
                 # interpreter shutdown; all consumers are already stopped.
                 pipeline_queue.cancel_join_thread()

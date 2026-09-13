@@ -26,8 +26,46 @@
         {
             "type": "rtsp",
             "value": "rtsp://192.168.0.8:8554/gibpi3"
+        },
+        {
+            "type": "rtsp",
+            "value": ""
+        },
+        {
+            "type": "rtsp",
+            "value": ""
+        },
+        {
+            "type": "rtsp",
+            "value": ""
         }
     ],
+    "camera_modes": {
+        "camera-1": {
+            "ocr": true,
+            "image": false
+        },
+        "camera-2": {
+            "ocr": false,
+            "image": true
+        },
+        "camera-3": {
+            "ocr": false,
+            "image": true
+        },
+        "camera-4": {
+            "ocr": false,
+            "image": false
+        },
+        "camera-5": {
+            "ocr": false,
+            "image": false
+        },
+        "camera-6": {
+            "ocr": false,
+            "image": false
+        }
+    },
     "audio_alerts": {
         "camera-1": {
             "enabled": true,
@@ -84,7 +122,10 @@
             0.4135667396061269
         ],
         "camera-2": null,
-        "camera-3": null
+        "camera-3": null,
+        "camera-4": null,
+        "camera-5": null,
+        "camera-6": null
     },
     "camera_1_inspection": {
         "placement_wait_seconds": 2.0,
